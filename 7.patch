@@ -1,0 +1,385 @@
+From 48a5cdce38ef93fd96302240211fed487ef6a26e Mon Sep 17 00:00:00 2001
+Message-Id: <48a5cdce38ef93fd96302240211fed487ef6a26e.1771142402.git.ritesh.list@gmail.com>
+In-Reply-To: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+References: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+From: Ritesh Harjani <ritesh.list@gmail.com>
+Date: Sun, 15 Feb 2026 12:53:32 +0530
+Subject: [RFC v1 7/8] radix-kernel/chapter 9: Implement (cmd_fault) exception
+ handling for page faults (DSI/ISI)
+
+Add real exception handlers for Data Storage Interrupt (0x300).
+
+- boot.S: create a new stackframe, store registers including LR
+  set up TOC, call C handler, restore registers, and rfid
+- radix_pgtable.c: handle_fault() C handler that prints exception details
+  (type, DAR, DSISR, SRR0) and skips the faulting instruction
+- main.c: 'fault' REPL command to deliberately trigger page faults
+
+The handler demonstrates the full exception flow:
+  CPU fault -> vector 0x300 -> save state -> handle_fault() -> skip insn -> rfid
+
+root-> ./run.sh
+Starting QEMU (paused, waiting for GDB on port 1234)...
+  To connect GDB:  ./gdb.sh
+  To quit QEMU:    Ctrl-B then x
+  To enter QEMU monitor:    Ctrl-B then c
+
+hello ppc-radix-kernel
+We are running on Qemu bare-metal Power9
+=== Memory Layout ===
+  _start: 0x0
+  _end:   0x30000
+  memblock initialized
+
+=== Radix MMU Initialization ===
+  k_pgd: 0xc000000000030000 (VA)
+  process table: 0x40000
+  partition table: 0x50000
+  PTCR set to: 0x50004
+  mapping kernel: PA 0x0 - 0x30000 to VA 0xc000000000000000 - 0xc000000000030000
+  mapping UART:   PA 0x60300d0010000 - 0x60300d0020000 to VA 0xc0060300d0010000 - 0xc0060300d0020000
+  mapping memblock: PA 0x30000 - 0x160000 to VA 0xc000000000030000 - 0xc000000000160000
+  page tables built successfully
+  enabling MMU (setting MSR[IR|DR])...
+  memblock_start:   0x30000
+  memblock_end:   0xc0000
+
+*** Running from virtual addresses! MMU is ON ***
+
+=== Radix MMU Explorer REPL ===
+Type 'help' for available commands.
+
+ppc> info
+
+=== MMU Register State ===
+  PTCR: 0x50004 (partition table @ 0x50000)
+  LPCR: 0x500008 [HR] [UPRT]
+  PID:  0x0
+  LPID: 0x0
+  MSR:  0x9000000000000030 [DR] [IR]
+  k_pgd: 0xc000000000030000 (VA)
+  k_pgd: 0x30000 (PA)
+  partition_tb: 0x50000
+  process_tb:   0x40000
+ppc> help
+Commands:
+  walk <hex_addr>       Walk page table for a virtual address
+  map <va> <pa>         Map a 64KB virtual page to physical
+  unmap <va>            Unmap a virtual page
+  read <va>             Read 8 bytes from a virtual address
+  write <va> <val>      Write 8 bytes to a virtual address
+  fault                 Trigger a page fault (access unmapped memory)
+  info                  Show MMU register state
+  help                  Show this help
+  quit                  Halt the CPU
+ppc> fault
+Triggering page fault by reading unmapped VA 0xdeadbeef0000...
+(The exception handler will catch this and skip the instruction)
+
+!!! EXCEPTION: DSI (Data Storage Interrupt) at 0xdeadbeef0000 !!!
+        DSISR:                  0x40000000
+        Faulting instruction:   0xc000000000011624
+        Cause: Translation not found (page not mapped)
+    Skipping faulting instruction (SRR0 += 4)
+    Returning from exception...
+
+Returned from fault handler successfully!
+ppc> walk 0xdeadbeef0000
+
+=== Page Table Walk for VA 0xdeadbeef0000 ===
+  Quadrant: 0 (user)
+  PGD index: 445
+  PUD index: 182
+  PMD index: 503
+  PTE index: 15
+  Offset:    0x0
+
+  PGD @ 0xc000000000030de8: 0x0 [EMPTY]
+ppc> fault
+Triggering page fault by reading unmapped VA 0xdeadbeef0000...
+(The exception handler will catch this and skip the instruction)
+
+!!! EXCEPTION: DSI (Data Storage Interrupt) at 0xdeadbeef0000 !!!
+        DSISR:                  0x40000000
+        Faulting instruction:   0xc000000000011624
+        Cause: Translation not found (page not mapped)
+    Skipping faulting instruction (SRR0 += 4)
+    Returning from exception...
+
+Returned from fault handler successfully!
+ppc> map 0xdeadbeef0000 0x2000000
+Mapping VA 0xdeadbeef0000 -> PA 0x2000000
+Done. Use 'walk 0xdeadbeef0000' to verify.
+ppc> walk 0xdeadbeef0000
+
+=== Page Table Walk for VA 0xdeadbeef0000 ===
+  Quadrant: 0 (user)
+  PGD index: 445
+  PUD index: 182
+  PMD index: 503
+  PTE index: 15
+  Offset:    0x0
+
+  PGD @ 0xc000000000030de8: 0x80000000000c0009 [Valid]
+  PUD @ 0xc0000000000c05b0: 0x80000000000d0009 [Valid]
+  PMD @ 0xc0000000000d0fb8: 0x80000000000e0005 [Valid]
+  PTE @ 0xc0000000000e0078: 0xc00000000200018e
+  => Physical page: 0x2000000
+  => Full PA:       0x2000000
+  => Flags: Valid Leaf Ref Dirty Priv Read Write
+ppc> fault
+Triggering page fault by reading unmapped VA 0xdeadbeef0000...
+(The exception handler will catch this and skip the instruction)
+
+Returned from fault handler successfully!
+ppc> unmap 0xdeadbeef0000
+Unmapping VA 0xdeadbeef0000
+Done.
+ppc> walk 0xdeadbeef0000
+
+=== Page Table Walk for VA 0xdeadbeef0000 ===
+  Quadrant: 0 (user)
+  PGD index: 445
+  PUD index: 182
+  PMD index: 503
+  PTE index: 15
+  Offset:    0x0
+
+  PGD @ 0xc000000000030de8: 0x80000000000c0009 [Valid]
+  PUD @ 0xc0000000000c05b0: 0x80000000000d0009 [Valid]
+  PMD @ 0xc0000000000d0fb8: 0x80000000000e0005 [Valid]
+  PTE @ 0xc0000000000e0078: 0x0
+  => NOT MAPPED
+ppc> fault
+Triggering page fault by reading unmapped VA 0xdeadbeef0000...
+(The exception handler will catch this and skip the instruction)
+
+!!! EXCEPTION: DSI (Data Storage Interrupt) at 0xdeadbeef0000 !!!
+        DSISR:                  0x40000000
+        Faulting instruction:   0xc000000000011624
+        Cause: Translation not found (page not mapped)
+    Skipping faulting instruction (SRR0 += 4)
+    Returning from exception...
+
+Returned from fault handler successfully!
+ppc>
+
+Signed-off-by: Ritesh Harjani <ritesh.list@gmail.com>
+---
+ boot.S      | 47 ++++++++++++++++++++++++++++++++++++++++++++++-
+ cmds.c      | 23 +++++++++++++++++++++++
+ radix-mmu.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ radix-mmu.h | 32 ++++++++++++++++++++++++++++++++
+ 4 files changed, 142 insertions(+), 1 deletion(-)
+
+diff --git a/boot.S b/boot.S
+index 58ee885..0e8da2f 100644
+--- a/boot.S
++++ b/boot.S
+@@ -54,6 +54,18 @@ _start:
+  * 0xeA0 - Hypervisor Virtualization
+  */
+ 
++#define STACKFRAMESIZE	256
++#define SPRN_DAR	0x013	/* Data Address Register */
++#define SPRN_DSISR	0x012	/* Data Storage Interrupt Status Register */
++
++#define SPRN_SRR0	0x01A	/* Save/Restore Register 0 */
++#define SPRN_SRR1	0x01B	/* Save/Restore Register 1 */
++
++#define SPRN_HDAR       0x133
++#define SPRN_HDSISR     0x132
++#define SPRN_HSRR0	0x13A	/* Save/Restore Register 0 */
++#define SPRN_HSRR1	0x13B	/* Save/Restore Register 1 */
++
+ #define EXCEPTION(nr)	\
+ 	. = nr;		\
+ 	b _exception_##nr
+@@ -74,7 +86,40 @@ _start:
+ 	 */
+ 	. = 0x10000
+ 
+-_exception_0x300:
++_exception_0x300: /* DSI */
++	/* Save registers onto the stack */
++	stdu r1, -STACKFRAMESIZE(r1)
++	std  r0, 120(r1)
++	std  r3, 128(r1)
++	std  r4, 136(r1)
++	std  r5, 144(r1)
++	std  r6, 152(r1)
++	mflr r0
++	std  r0,  112(r1)	/* Save LR */
++
++	/* Set up r2 (TOC) - needed for C function calls */
++	lis  r2, __toc_start@ha
++	addi r2, r2, __toc_start@l
++
++	/* Load C handler arguments */
++	li   r3, 0x300		/* arg1: exception type = DSI */
++	mfspr r4, SPRN_DAR	/* arg2: DAR (faulting data address) */
++	mfspr r5, SPRN_DSISR	/* arg3: DSISR (fault cause bits) */
++	mfspr r6, SPRN_SRR0	/* arg4: SRR0 (faulting instruction address) */
++
++	/* C handler */
++	bl handle_fault
++
++	/* Restore registers */
++	ld   r0,  112(r1)
++	mtlr r0
++	ld   r6,  152(r1)
++	ld   r5,  144(r1)
++	ld   r4,  136(r1)
++	ld   r3,  128(r1)
++	ld   r0,  120(r1)
++	addi r1, r1, STACKFRAMESIZE	/* Restore stack pointer */
++
+ _exception_0x380:
+ _exception_0x400:
+ _exception_0x480:
+diff --git a/cmds.c b/cmds.c
+index 6b7e2a2..218e592 100644
+--- a/cmds.c
++++ b/cmds.c
+@@ -10,6 +10,7 @@
+  *   unmap <va>		- Remove a page mapping
+  *   read <va>		- Read 8 bytes from a virtual address
+  *   write <va> <val>	- Write 8 bytes to a virtual address
++ *   fault		- Trigger a page fault (by accessing an unmapped address)
+  *   info		- Show MMU register state (PTCR, LPCR, etc.)
+  *   help		- Show available commands
+  *   quit		- Halt
+@@ -122,11 +123,31 @@ static void cmd_help(void)
+ 	printk("  unmap <va>		Unmap a virtual page\n");
+ 	printk("  read <va>		Read 8 bytes from a virtual address\n");
+ 	printk("  write <va> <val>	Write 8 bytes to a virtual address\n");
++	printk("  fault			Trigger a page fault (access unmapped memory)\n");
+ 	printk("  info			Show MMU register state\n");
+ 	printk("  help			Show this help\n");
+ 	printk("  quit			Halt the CPU\n");
+ }
+ 
++/*
++ * cmd_fault: Trigger a page fault.
++ *
++ * Accesses an unmapped virtual address to demonstrate the DSI handler.
++ * The exception handler in boot.S will call handle_fault() in C,
++ * which prints the fault details and skips the faulting instruction.
++ */
++static void cmd_fault(void)
++{
++	printk("Triggering page fault by reading unmapped VA 0xdeadbeef0000...\n");
++	printk("(The exception handler will catch this and skip the instruction)\n\n");
++
++	volatile uint64_t dummy;
++	dummy = *(volatile uint64_t *)0xdeadbeef0000ULL;
++	(void)dummy;
++
++	printk("Returned from fault handler successfully!\n");
++}
++
+ /*
+  * cmd_walk - Walk the page table for a given virtual address.
+  *
+@@ -253,6 +274,8 @@ void repl(void)
+ 		} else if (strncmp(cmd, "walk ", 5) == 0) {
+ 			const char *arg = skip_spaces(cmd + 5);
+ 			cmd_walk(parse_hex(arg));
++		} else if (strncmp(cmd, "fault", 5) == 0) {
++			cmd_fault();
+ 		} else if (strncmp(cmd, "map ", 4) == 0) {
+ 			const char *arg1 = skip_spaces(cmd + 4);
+ 			const char *arg2 = skip_spaces(skip_word(arg1));
+diff --git a/radix-mmu.c b/radix-mmu.c
+index f1db812..5e24bed 100644
+--- a/radix-mmu.c
++++ b/radix-mmu.c
+@@ -761,3 +761,44 @@ void radix_print_info(void)
+ 	printk("  partition_tb: 0x%x\n", (uint64_t)partition_tb);
+ 	printk("  process_tb:   0x%x\n", (uint64_t)process_tb);
+ }
++
++void handle_fault(uint64_t type, uint64_t dar, uint64_t dsisr, uint64_t srr0)
++{
++	printk("\n!!! EXCEPTION: %s at 0x%x !!!\n",
++		type == 0x300 ? "DSI (Data Storage Interrupt)" :
++		type == 0x400 ? "ISI (Instruction Storage Interrupt)" :
++		"Unknown",
++		dar);
++	printk("	DSISR:			0x%x\n", dsisr);
++	printk("	Faulting instruction: 	0x%x\n", srr0);
++
++	if (type == 0x300) {
++		printk("	Cause: ");
++		if (dsisr & DSISR_NOHPTE)
++			printk("Translation not found (page not mapped)");
++		else if (dsisr & DSISR_PROTFAULT)
++			printk("Protection fault (permission denied)");
++		else
++			printk("Other fault (see DSISR bits in radix-mmu.h");
++		printk("\n");
++	}
++
++	/*
++	 * Skip past the faulting instruction.
++	 *
++	 * We modify SRR0 (saved in SPR 26) to point 4 bytes ahead.
++	 * When rfid executes, it will resume at the next instruction
++	 * instead of re-executing the faulting one.
++	 *
++	 * In a real OS, you would either:
++	 *   a) Map the page and retry the instruction (demand paging), or
++	 *   b) Kill the faulting process
++	 */
++	asm volatile("mfspr 3, 26\n\t"   /* r3 = SRR0 */
++		     "addi 3, 3, 4\n\t"   /* r3 += 4 (skip one instruction) */
++		     "mtspr 26, 3\n\t"    /* SRR0 = r3 */
++		     ::: "r3", "memory");
++
++	printk("    Skipping faulting instruction (SRR0 += 4)\n");
++	printk("    Returning from exception...\n\n");
++}
+diff --git a/radix-mmu.h b/radix-mmu.h
+index 310cb7d..4f72e9f 100644
+--- a/radix-mmu.h
++++ b/radix-mmu.h
+@@ -205,4 +205,36 @@ extern void radix_walk_page_table(uint64_t va, struct walk_result *r);
+ extern void radix_print_info();
+ extern void radix_map_page(uint64_t va, uint64_t pa);
+ extern void radix_unmap_page();
++
++
++/*
++ * Cause of fault in DSISR bits:
++ * From arch/powerpc/include/asm/reg.h
++ */
++#define   DSISR_BAD_DIRECT_ST	0x80000000 /* Obsolete: Direct store error */
++#define   DSISR_NOHPTE		0x40000000 /* no translation found */
++#define   DSISR_ATTR_CONFLICT	0x20000000 /* P9: Process vs. Partition attr */
++#define   DSISR_NOEXEC_OR_G	0x10000000 /* Alias of SRR1 bit, see below */
++#define   DSISR_PROTFAULT	0x08000000 /* protection fault */
++#define   DSISR_BADACCESS	0x04000000 /* bad access to CI or G */
++#define   DSISR_ISSTORE		0x02000000 /* access was a store */
++#define   DSISR_DABRMATCH	0x00400000 /* hit data breakpoint */
++#define   DSISR_NOSEGMENT	0x00200000 /* STAB miss (unsupported) */
++#define   DSISR_KEYFAULT	0x00200000 /* Storage Key fault */
++#define   DSISR_BAD_EXT_CTRL	0x00100000 /* Obsolete: External ctrl error */
++#define   DSISR_UNSUPP_MMU	0x00080000 /* P9: Unsupported MMU config */
++#define   DSISR_SET_RC		0x00040000 /* P9: Failed setting of R/C bits */
++#define   DSISR_PRTABLE_FAULT   0x00020000 /* P9: Fault on process table */
++#define   DSISR_ICSWX_NO_CT     0x00004000 /* P7: icswx unavailable cp type */
++#define   DSISR_BAD_COPYPASTE   0x00000008 /* P9: Copy/Paste on wrong memtype */
++#define   DSISR_BAD_AMO		0x00000004 /* P9: Incorrect AMO opcode */
++#define   DSISR_BAD_CI_LDST	0x00000002 /* P8: Bad HV CI load/store */
++
++/* Define SPR registers */
++#define SPRN_SRR0	0x01A	/* Save/Restore Register 0 */
++#define SPRN_SRR1	0x01B	/* Save/Restore Register 1 */
++
++#define SPRN_HSRR0	0x13A	/* Save/Restore Register 0 */
++#define SPRN_HSRR1	0x13B	/* Save/Restore Register 1 */
++
+ #endif
+-- 
+2.39.5
+

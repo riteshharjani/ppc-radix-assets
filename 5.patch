@@ -1,0 +1,1028 @@
+From a0b7f514df446155d1f523234f896c4fa055e073 Mon Sep 17 00:00:00 2001
+Message-Id: <a0b7f514df446155d1f523234f896c4fa055e073.1771142402.git.ritesh.list@gmail.com>
+In-Reply-To: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+References: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+From: Ritesh Harjani <ritesh.list@gmail.com>
+Date: Sun, 15 Feb 2026 12:53:20 +0530
+Subject: [RFC v1 5/8] raxix-kernel/chapter 6-7: Implement radix MMU for
+ PowerPC64
+
+Implement complete Radix MMU initialization:
+- radix_mmu.h: public interface (radix_mmu_init, radix_mmu_enable)
+- radix_pgtable.c: full Radix MMU implementation:
+  - Multi-level linux page tables of types (pgd_t, pud_t, pmd_t, pte_t)
+  - SPR access macros (mfspr/mtspr) for PTCR, LPCR, PID, LPID
+  - Partition table setup (PATB with HR/GR flags)
+  - Process table setup (PRTB with RTS/RPDB/RPDS)
+  - 4-level page table walk: map_kernel_page()
+  - Kernel mapping: VA=PA|0xC000... for all memory up to _end
+    & memblock_end
+  - UART MMIO mapping so serial works after MMU on
+  - radix_mmu_enable(): set MSR[IR|DR] to turn on translation
+- main.c: jump_to_offset() to relocate kernel to virtual addresses
+- build.sh: compile and link radix_pgtable.c
+
+root-> ./run.sh
+Starting QEMU (paused, waiting for GDB on port 1234)...
+  To connect GDB:  ./gdb.sh
+  To quit QEMU:    Ctrl-B then x
+  To enter QEMU monitor:    Ctrl-B then c
+
+hello ppc-radix-kernel
+We are running on Qemu bare-metal Power9
+=== Memory Layout ===
+  _start: 0x0
+  _end:   0x30000
+  memblock initialized
+
+=== Radix MMU Initialization ===
+  k_pgd: 0xc000000000030000 (VA)
+  process table: 0x40000
+  partition table: 0x50000
+  PTCR set to: 0x50004
+  mapping kernel: PA 0x0 - 0x30000 to VA 0xc000000000000000 - 0xc000000000030000
+  mapping UART:   PA 0x60300d0010000 - 0x60300d0020000 to VA 0xc0060300d0010000 - 0xc0060300d0020000
+  mapping kernel: PA 0x30000 - 0x160000 to VA 0xc000000000030000 - 0xc000000000160000
+  page tables built successfully
+  enabling MMU (setting MSR[IR|DR])...
+  memblock_start:   0x30000
+  memblock_end:   0xc0000
+
+*** Running from virtual addresses! MMU is ON ***
+
+Signed-off-by: Ritesh Harjani <ritesh.list@gmail.com>
+---
+ build.sh    |   5 +-
+ main.c      |  73 +++++-
+ radix-mmu.c | 646 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ radix-mmu.h | 188 +++++++++++++++
+ 4 files changed, 900 insertions(+), 12 deletions(-)
+ create mode 100644 radix-mmu.c
+ create mode 100644 radix-mmu.h
+
+diff --git a/build.sh b/build.sh
+index 32cc052..2761a95 100755
+--- a/build.sh
++++ b/build.sh
+@@ -45,13 +45,16 @@ ${CROSS_COMPILE}gcc -c uart.c -o uart.o -I${INCLUDE_PATH} ${CFLAGS}
+ echo "  [CC]  memblock.c"
+ ${CROSS_COMPILE}gcc -c memblock.c -o memblock.o -I${INCLUDE_PATH} ${CFLAGS}
+ 
++echo "  [CC]  radix-mmu.c"
++${CROSS_COMPILE}gcc -c radix-mmu.c -o radix-mmu.o -I${INCLUDE_PATH} ${CFLAGS}
++
+ echo "  [CC]  main.c"
+ ${CROSS_COMPILE}gcc -c main.c -o main.o -I${INCLUDE_PATH} ${CFLAGS}
+ 
+ # Step 3: Link everything using our linker script
+ # -T link.lds specifies our custom linker script
+ echo "  [LD]  kernel.elf"
+-${CROSS_COMPILE}ld -T link.lds -o kernel.elf boot.o main.o uart.o memblock.o
++${CROSS_COMPILE}ld -T link.lds -o kernel.elf boot.o main.o uart.o memblock.o radix-mmu.o
+ 
+ # Step 4: Extract raw binary from ELF
+ # objcopy -O binary strips all ELF headers and produces a flat binary.
+diff --git a/main.c b/main.c
+index dc7d4e6..bcc4e72 100644
+--- a/main.c
++++ b/main.c
+@@ -16,6 +16,48 @@
+ 
+ #include "uart.h"
+ #include "memblock.h"
++#include "radix-mmu.h"
++
++/*
++ * jump_to_offset - Relocate the kernel to virtual addresses.
++ *
++ * After enabling the MMU, we're still executing from physical addresses
++ * (because the PC hasn't changed). We need to jump to the virtual
++ * address of our code: PA | 0xC000000000000000.
++ *
++ * This function modifies the Link Register (LR) by adding PAGE_OFFSET.
++ * When we execute 'blr' (branch to LR), we jump to the virtual address
++ * of the caller's return point. From then on, all code runs from VA.
++ *
++ * This is a common trick in OS kernels - Linux does something similar
++ * in its early boot code (arch/powerpc/kernel/head_64.S).
++ */
++void jump_to_offset(void)
++{
++	asm volatile(
++		/* Save LR to r12 (scratch register) */
++		"mflr 12 \n\t"
++
++		/* Build 0xC000000000000000 in r4:
++		 *   li r4, 1         - r4 = 1
++		 *   sldi r4, r4, 62  - r4 = 0x4000000000000000
++		 *   sldi r5, r4, 1   - r5 = 0x8000000000000000
++		 *   add r4, r4, r5   - r4 = 0xC000000000000000
++		 */
++		"li 4, 1 \n\t"
++		"sldi 4, 4, 62 \n\t"
++		"sldi 5, 4, 1 \n\t"
++		"add 4, 4, 5 \n\t"
++
++		/* Add PAGE_OFFSET to LR(r12) and return to virtual address */
++		"add 12, 12, 4 \n\t"
++		"mtlr 12 \n\t"
++		:
++		:
++		: "r4", "r5", "r12", "lr", "ctr", "memory"
++	);
++	asm volatile("blr");
++}
+ 
+ void k_main(void)
+ {
+@@ -30,21 +72,30 @@ void k_main(void)
+ 
+ 	/* Initialize the memory allocator */
+ 	memblock_init();
+-	printk("\nmemblock initialized\n");
++	printk("  memblock initialized\n");
++
++	/*
++	 * Radix mmu init and enable
++	 */
++	radix_mmu_init();
++	radix_mmu_enable();
+ 
+-	/* Test some allocations: 4KB, 4KB-aligned */
+-	uint64_t a1 = memblock_alloc(4096, 4096);
+-	printk("  alloc 4KB  @ 0x%x\n", a1);
++	/* print current memblock limits */
++	printk("  memblock_start:   0x%x\n", (uint64_t)memblock_start);
++	printk("  memblock_end:   0x%x\n", (uint64_t)memblock_end);
+ 
+-	/* 64KB, 64KB-aligned */
+-	uint64_t a2 = memblock_alloc(65536, 65536);
+-	printk("  alloc 64KB @ 0x%x\n", a2);
++	/*
++	 * Jump to virtual addresses.
++	 * After this call, we're executing from 0xC000... addresses.
++	 */
++	jump_to_offset();
+ 
+-	/* 256B, 256B-aligned */
+-	uint64_t a3 = memblock_alloc(256, 256);
+-	printk("  alloc 256B @ 0x%x\n", a3);
++	/*
++	 * We're now running from virtual addresses!
++	 * If this printk works, the MMU is translating correctly.
++	 */
++	printk("\n*** Running from virtual addresses! MMU is ON ***\n");
+ 
+-	printk("\nmemblock test passed!\n");
+ 
+ 	/*
+ 	 * Nothing to do yet - just spin.
+diff --git a/radix-mmu.c b/radix-mmu.c
+new file mode 100644
+index 0000000..5baa2ae
+--- /dev/null
++++ b/radix-mmu.c
+@@ -0,0 +1,646 @@
++/*
++ * radix-mmu.c: Radix mmu page table setup for PowerPC64 (Power9+)
++ *
++ * This implements the complete Radix mmu initialization routine:
++ *
++ * 1. Define the page table types (pgd_t, pud_t, pmd_t, pte_t)
++ * 2. setup
++ *
++ */
++
++
++/* ============================================================
++ * Section: Page table entry types
++ *
++ * Each level wraps a single uint64_t in a struct for type safety.
++ * This prevents accidentally passing a PUD entry where a PGD is expected.
++ * This pattern comes from the Linux kernel.
++ * ============================================================
++ */
++
++#include "uart.h"
++#include "memblock.h"
++#include "radix-mmu.h"
++
++/* Helper routines */
++
++typedef unsigned long long __be64;
++typedef uint64_t __be64;
++/*
++ * PTE or PDE entries in the radix page tables are stored in big endian order.
++ * PowerPC64 CPU also is big endian by default and we too are implementing
++ * radix-kernel in big endian mode, hence below two are just identity functions.
++ */
++#define be64_to_cpu(x)	(x)
++#define cpu_to_be64(x)	(x)
++
++
++typedef struct { __be64 pgd; } pgd_t;
++#define __pgd(x)			((pgd_t) { cpu_to_be64(x) })
++static inline uint64_t pgd_val(pgd_t x)	{ return be64_to_cpu(x.pgd); }
++static inline uint64_t pgd_raw(pgd_t x) { return x.pgd; }
++
++typedef struct { __be64 pud; } pud_t;
++#define __pud(x)			((pud_t) { cpu_to_be64(x) })
++static inline uint64_t pud_val(pud_t x)	{ return be64_to_cpu(x.pud); }
++static inline uint64_t pud_raw(pud_t x) { return x.pud; }
++
++typedef struct { __be64 pmd; } pmd_t;
++#define __pmd(x)			((pmd_t) { cpu_to_be64(x) })
++static inline uint64_t pmd_val(pmd_t x)	{ return be64_to_cpu(x.pmd); }
++static inline uint64_t pmd_raw(pmd_t x) { return x.pmd; }
++
++typedef struct { __be64 pte; } pte_t;
++#define __pte(x)			((pte_t) { cpu_to_be64(x) })
++static inline uint64_t pte_val(pte_t x)	{ return be64_to_cpu(x.pte); }
++static inline uint64_t pte_raw(pte_t x) { return x.pte; }
++
++/* Page protection bits - wraps a uint64_t for type safety */
++typedef struct { uint64_t pgprot; } pgprot_t;
++#define pgprot_val(x)	((x).pgprot)
++#define __pgprot(x)	((pgprot_t) { (x) })
++
++/* ============================================================
++ * Section: Linux multi-level Page table
++ *
++ *
++ * How virtual address bits map to page table indices:
++ *
++ *   PAGE_SHIFT  = 16 (64KB pages)
++ *   PMD_SHIFT   = PAGE_SHIFT + 5 = 16 + 5 = 21
++ *   PUD_SHIFT   = PMD_SHIFT + 9 = 21 + 9 = 30
++ *   PGDIR_SHIFT = PUD_SHIFT + 9 = 30 + 9 = 39
++ *
++ *  63  62 61   52                   39            30            21        16              0
++ * +------+-------+--------------------+-------------+-------------+---------+--------------+
++ * |  Top |       |    PGD index       |  PUD index  |  PMD index  |PTE index| Page Offset  |
++ * |  2b  |       |      13 bits       |   9 bits    |   9 bits    | 5 bits  |    16 bits   |
++ * +------+-------+--------------------+-------------+-------------+---------+--------------+
++ *                  8192 entries          512 entries   512 entries  32 entries   64KB page
++ *                  64KB table            4KB table     4KB table    256B table
++ *
++ *
++ *   EA bits [63:62] = Quadrant (used by hardware, not indexed)
++ *   EA bits [51:39] = PGD index (13 bits)
++ *   EA bits [38:30] = PUD index (9 bits)
++ *   EA bits [29:21] = PMD index (9 bits)
++ *   EA bits [20:16] = PTE index (5 bits)
++ *   EA bits [15:0]  = Page offset (16 bits)
++ * ============================================================
++ */
++
++#define PMD_SHIFT	(PAGE_SHIFT + RADIX_PTE_INDEX_SIZE)	/* 21 */
++#define PMD_SIZE	(1ULL << PMD_SHIFT)
++
++#define PUD_SHIFT	(PMD_SHIFT + RADIX_PMD_INDEX_SIZE)	/* 30 */
++#define PUD_SIZE	(1ULL << PUD_SHIFT)
++
++#define PGDIR_SHIFT	(PUD_SHIFT + RADIX_PUD_INDEX_SIZE)	/* 39 */
++#define PGDIR_SIZE	(1ULL << PGDIR_SHIFT)
++
++/* Number of entries at each level */
++#define PTRS_PER_PTE	(1ULL << RADIX_PTE_INDEX_SIZE)	/* 32 */
++#define PTRS_PER_PMD	(1ULL << RADIX_PMD_INDEX_SIZE)	/* 512 */
++#define PTRS_PER_PUD	(1ULL << RADIX_PUD_INDEX_SIZE)	/* 512 */
++#define PTRS_PER_PGD	(1ULL << RADIX_PGD_INDEX_SIZE)	/* 8192 */
++
++#define MAX_PTRS_PER_PGD	(1U << RADIX_PGD_INDEX_SIZE)  /* 8192 */
++
++/*
++ * Bits to mask out from a page table entry to get the physical address
++ * of the next-level table. The low byte contains the NLS field,
++ * and the top 2 bits are Valid/Leaf flags.
++ */
++#define PGD_MASKED_BITS		0xc0000000000000ffUL
++#define PUD_MASKED_BITS		0xc0000000000000ffUL
++#define PMD_MASKED_BITS		0xc0000000000000ffUL
++
++/* ============================================================
++ * Section: Page table index extraction and traversal
++ *
++ * These functions extract the index for each level from a
++ * virtual address, and navigate between levels.
++ * ============================================================
++ */
++
++/*
++ * pte_index: It's the index within a PTE table based on the PTE bits
++ * of the vaddr (EA).
++ */
++static inline uint64_t pte_index(uint64_t vaddr)
++{
++	return (vaddr >> PAGE_SHIFT) & (PTRS_PER_PTE - 1);
++}
++
++static inline uint64_t pmd_index(uint64_t vaddr)
++{
++	return (vaddr >> PMD_SHIFT) & (PTRS_PER_PMD - 1);
++}
++
++static inline uint64_t pud_index(uint64_t vaddr)
++{
++	return (vaddr >> PUD_SHIFT) & (PTRS_PER_PUD - 1);
++}
++
++static inline uint64_t pgd_index(uint64_t vaddr)
++{
++	return (vaddr >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1);
++}
++
++/*
++ * k_pgd: Radix Root of the PGD (The root page global directory)
++ * We program the base address of this in RPDB.
++ * Both in 1st double word of partition table which points to the root of the
++ * radix PGD for partition scoped translation.
++ * And in 1st double word of process table which also points to the root of the
++ * radix PGD for process scoped translation.
++ */
++pgd_t *k_pgd;
++
++static inline pgd_t *pgd_offset_k(uint64_t vaddr)
++{
++	return k_pgd + pgd_index(vaddr);
++}
++
++/*
++ * Navigate from one level to the next.
++ *
++ * Each non-leaf entry stores the PHYSICAL address of the next-level
++ * table in bits [7:51], plus some flag bits. We mask off the flags
++ * and convert to a virtual address to get a usable pointer.
++ *
++ * pud_offset: 	Returns pointer (virtual address) to the
++ * 		root of the PUD Table + index into the PUD Table.
++ * 		=> virtual address of the entry within the PUD Table.
++ * @*pgd: 	*pgd contains an entry within the pgd_t table.
++ * @vaddr: 	Effective address for which translation is requested.
++ */
++static inline pud_t *pud_offset(pgd_t *pgd, uint64_t vaddr)
++{
++	pud_t *base = (pud_t *) __va((pgd_val(*pgd) & ~PGD_MASKED_BITS));
++	return base + pud_index(vaddr);
++}
++
++static inline pmd_t *pmd_offset(pud_t *pud, uint64_t vaddr)
++{
++	pmd_t *base = (pmd_t *)__va((pud_val(*pud) & ~PUD_MASKED_BITS));
++	return base + pmd_index(vaddr);
++}
++
++static inline pte_t *pte_offset(pmd_t *pmd, uint64_t vaddr)
++{
++	pte_t *base = (pte_t *) __va((pmd_val(*pmd) & ~PMD_MASKED_BITS));
++	return base + pte_index(vaddr);
++}
++
++/* Check if an entry is empty (all zeros = not yet populated) */
++static inline int pgd_none(pgd_t pgd)  { return !pgd_raw(pgd); }
++static inline int pud_none(pud_t pud)  { return !pud_raw(pud); }
++static inline int pmd_none(pmd_t pmd)  { return !pmd_raw(pmd); }
++
++static inline int pmd_present(pmd_t pmd)
++{
++	if (pmd_raw(pmd) & cpu_to_be64(_PAGE_PRESENT))
++		return 1;
++	return 0;
++}
++
++/*
++ * Populate a directory entry - write the physical address of the
++ * next-level table along with the appropriate NLS bits.
++ *
++ * pgd_populate: Populate the pgd entry with pointer to the base of pud table.
++ * @pud: pud pointer here points to the base of the PUD Table.
++ * Since we must have allocated this PUD table, pud pointer carries a virtual
++ * address, but page table entries (PDEs) should encode physical address for MMU
++ * HW traversal, hence we convert this virt to phys address.
++ *
++ * @pgd: *pgd is the address of the PDE PGD entry where NLS and NLB value needs
++ * to be added.
++ */
++static inline void pgd_populate(pgd_t *pgd, pud_t *pud)
++{
++	*pgd = __pgd(__pa((uint64_t)pud) | RADIX_PGD_VAL_BITS);
++}
++
++static inline void pud_populate(pud_t *pud, pmd_t *pmd)
++{
++	*pud = __pud(__pa((uint64_t)pmd) | RADIX_PUD_VAL_BITS);
++
++}
++
++static inline void pmd_populate(pmd_t *pmd, pte_t *pte)
++{
++	*pmd = __pmd(__pa((uint64_t)pte) | RADIX_PMD_VAL_BITS);
++}
++
++/*
++ * Create a leaf PTE from a page frame number and protection bits.
++ *
++ * pfn_pte(pfn, prot):
++ *   - Shift PFN left by PAGE_SHIFT to get the RPN field
++ *   - OR in the protection bits
++ *   - Set the _PAGE_PTE bit (marks this as a leaf entry)
++ */
++static inline pte_t pfn_pte(uint64_t pfn, pgprot_t prot)
++{
++	return __pte((pfn << PAGE_SHIFT) | pgprot_val(prot) | _PAGE_PTE);
++}
++
++static inline void set_pte_at(uint64_t ea, pte_t *ptep, pte_t pte)
++{
++	*ptep = pte;
++}
++
++/* ============================================================================
++ * Section 7: Partition and Process table structures
++ *
++ * The Radix MMU on PowerPC64 uses two level of translation:
++ *   (Partition scoped translation and process scoped translation)
++ *
++ * The Partition Table is indexed by LPID (Logical Partition ID).
++ * Since we're the hypervisor (LPID=0), we use entry 0.
++ *
++ * The Process Table is indexed by PID (Process ID).
++ * We set PID=0 for kernel and use entry 0.
++ *
++ * Each table entry is 2 doublewords (16 bytes).
++ *
++ * PTCR contains this:
++ *   which has base address of partition table base and partition table size.
++ *
++ *   0    3                                                 51 52   58     63
++ * +------+--------------------------------------------------+------+------+
++ * | ///  |                     PATB                         |  //  | PATS |
++ * +------+--------------------------------------------------+------+------+
++ *
++ * Partition Table entry format is:
++ *     which contains root of radix PGD for partition scoped translation in dw0
++ *     and base address of process table in dw1
++ *
++ *     0  1   2 3 4                                            55 56 58 59   63
++ *     +--+----+--+----------------------------------------------+-----+------+
++ * DW0 | 1|RTS1| S|                   RPDB                       |RTS2 | RPDS |
++ *     +--+----+--+----------------------------------------------+-----+------+
++ *
++ *      0        3 4                                   51 52         58 59   63
++ *     +----------+--------------------------------------+-------------+------+
++ * DW1 |    /     |                  PRTB                |     ///     | PRTS |
++ *     +------+---+---------------------------------------------+------+------+
++ *                                                             DW = Double-word
++ *
++ *
++ * Process table entry format is:
++ *     which contains root of radix PGD for process scoped translation in dw0
++ *     second double word is reserved
++ *
++ *      0  1  2  3 4                                           55 56 58 59   63
++ *     +--+----+--+----------------------------------------------+-----+------+
++ * DW0 | /|RTS1| /|                   RPDB                       |RTS2 | RPDS |
++ *     +--+----+--+----------------------------------------------+-----+------+
++ *      0                                                                    63
++ *     +----------------------------------------------------------------------+
++ * DW1 |                             ///                                      |
++ *     +----------------------------------------------------------------------+
++ *
++ * Bit layout of a Process Table Entry:
++ *   [59:63] RPDS		- Root Page Directory Size = 2^(RPDS+3), RPDS ≥ 5
++ *   [56:58] RTS2		- Radix Tree Size[2:4] (number of address bits mapped), size = 2^(RTS+31)
++ *   [4:55] RPDB 		- Root Page Directory Base (real address of process-scoped root PGD)
++ *   [1:2] RTS1			- Radix Tree Size[0:1]
++ * ============================================================================
++ */
++
++struct patb_entry {
++	__be64 patb0;
++	__be64 patb1;
++};
++
++struct prtb_entry {
++	__be64 prtb0;
++	__be64 prtb1;
++};
++
++struct patb_entry *partition_tb;
++struct prtb_entry *process_tb;
++
++/* Partition table entry flags */
++/*
++ * Even though ISA does not define PATB_GR, but we are using it like how linux
++ * does. I think it might be only relevant for kvm ... but let's keep it
++ * consistent.
++ */
++#define PATB_HR		(1ULL << 63)	/* Host Radix - partition uses radix */
++#define PATB_GR		(1ULL << 63)	/* Guest Radix - must match HR */
++
++/*
++ * Table size shifts:
++ *   PATB: 2^16 bytes (64KB) - enough for many LPIDs
++ *   PRTB: 2^16 bytes (64MB) - enough for many PIDs
++ *
++ * The PATS/PRTS fields in PTCR and PATB store (shift - 12).
++ */
++#define PATB_SIZE_SHIFT	(12 + 4)	/* 2^16 = 64KB */
++#define PRTB_SIZE_SHIFT	(12 + 4)	/* 2^16 = 64KB */
++
++/* ============================================================
++ * Section: radix_mmu_enable() - Turn on address translation
++ *
++ * This sets the IR (Instruction Relocate) and DR (Data Relocate)
++ * bits in the MSR (Machine State Register).
++ *
++ * After this function returns, ALL memory accesses go through
++ * the page tables. Any access to an unmapped address will cause
++ * a Data Storage Interrupt (0x300) or Instruction Storage
++ * Interrupt (0x400).
++ * ============================================================
++ */
++void radix_mmu_enable(void)
++{
++	uint64_t val;
++
++	printk("  enabling MMU (setting MSR[IR|DR])...\n");
++
++	/*
++	 * Read current MSR, set IR and DR bits, write back.
++	 *
++	 * MSR bit 58 (63-5) = DR (Data Relocate)
++	 * MSR bit 59 (63-4) = IR (Instruction Relocate)
++	 *
++	 * After mtmsr, ALL memory accesses are translated.
++	 * isync ensures the new MSR takes effect before we
++	 * execute the next instruction.
++	 */
++	asm volatile("mfmsr %0" : "=r"(val) : : "memory");
++	val |= (1ULL << 5) | (1ULL << 4);	/* IR | DR */
++	asm volatile("mtmsr %0" :: "r"(val) : "memory");
++	asm volatile("isync" ::: "memory");
++	asm volatile("ptesync" ::: "memory");
++}
++
++/* ============================================================
++ * Section: Hardware table setup - radix_setup_tables()
++ *
++ * This sets up the partition table and process table that the
++ * hardware reads during address translation.
++ * ============================================================
++ */
++void radix_setup_tables(void)
++{
++	uint64_t ptcr, lpcr;
++	/*
++	 * RTS (Radix Tree Size): RTS1 | RTS2
++	 * encodes the size of the virtual address space.
++	 * This is a split field:
++	 *   Bits 56:58 holds RTS[2:4]
++	 *   Bits 1:2 holds RTS[0:1]
++	 *
++	 * The encoding gives us a 52-bit effective address space,
++	 * which is the maximum for POWER9 Radix.
++	 * 52
++	 * => 0x10 goes in RTS [0:1] which is [1:2] RTS1
++	 * => 0x101 goes in RTS[2:4] which is [56:58] RTS2
++	 *
++	 * RTS value = 0x2A -> (0x5 in bits 5:7) | (0x2 in bits 61:62)
++	 */
++	uint64_t rts_field = (0x5ULL << (63 - 58)) | (0x2ULL << (63 - 2));
++
++	process_tb = (struct prtb_entry *) memblock_alloc(
++				1ULL << PRTB_SIZE_SHIFT,
++				1ULL << PRTB_SIZE_SHIFT);
++
++	process_tb->prtb0 = cpu_to_be64(rts_field |
++					__pa((uint64_t)k_pgd) |
++					RADIX_PGD_INDEX_SIZE);
++
++	printk("  process table: 0x%x\n", (uint64_t)process_tb);
++
++	/*
++	 * Allocate and fill the Partition Table.
++	 *
++	 * Entry 0 (LPID=0, our hypervisor partition):
++	 *   dw0: HR | RTS | RPDB | RPDS
++	 *        HR = use Radix for this partition
++	 *   dw1: GR | PRTB (process table base) | PRTS
++	 *        GR = guest uses Radix too (must match HR)
++	 */
++	partition_tb = (struct patb_entry *)memblock_alloc(
++				1ULL << PATB_SIZE_SHIFT,
++				1ULL << PATB_SIZE_SHIFT);
++
++	partition_tb[0].patb0 = rts_field |
++				__pa((uint64_t)k_pgd) |
++				RADIX_PGD_INDEX_SIZE |
++				PATB_HR;
++	partition_tb[0].patb1 = __pa((uint64_t)process_tb) |
++				(PRTB_SIZE_SHIFT - 12) |
++				PATB_GR;
++
++	printk("  partition table: 0x%x\n", (uint64_t)partition_tb);
++
++	/*
++	 * Write PTCR - Partition Table Control Register.
++	 * This tells the hardware where the partition table lives.
++	 * Format: physical_address | (size_shift - 12)
++	 */
++	ptcr = __pa((uint64_t)partition_tb) | (PATB_SIZE_SHIFT - 12);
++	mtspr(SPRN_PTCR, ptcr);
++
++	printk("  PTCR set to: 0x%x\n", ptcr);
++
++	/*
++	 * Set LPCR register:
++	 *   Let's also inform LPCR that we will use radix mode and process
++	 *   table (UPRT).
++	 *   HR   - Host uses Radix mode
++	 *   UPRT - Use Process Table for translation
++	 */
++	lpcr = mfspr(SPRN_LPCR);
++	mtspr(SPRN_LPCR, lpcr | LPCR_UPRT | LPCR_HR);
++}
++
++/* ============================================================
++ * Section: The page table walk - map_kernel_page()
++ *
++ * This is the core function that creates a VA -> PA mapping.
++ * It walks the 4-level page table, allocating intermediate tables
++ * as needed, and installs the final PTE.
++ * ============================================================
++ */
++
++int map_kernel_page(uint64_t ea, uint64_t pa, pgprot_t prot, uint64_t map_size)
++{
++	uint64_t pfn = pa >> PAGE_SHIFT;
++	pgd_t *pgdp;
++	pud_t *pudp;
++	pmd_t *pmdp;
++	pte_t *ptep;
++
++	/*
++	 * Step 1: Find the PGD entry for this virtual address.
++	 * pgd_offset_k uses pgd_index(ea) to extract the top 13 bits.
++	 */
++	pgdp = pgd_offset_k(ea);
++	if (pgd_none(*pgdp)) {
++		/*
++		 * PGD entry is empty - allocate a PUD page.
++		 * This (PUD Table) is a 4KB table with 512 entries.
++		 * We write the physical address of this table into the PGD
++		 * entry.
++		 * We still allocate a min. of PAGE_SIZE to keep it simple.
++		 */
++		pudp = (pud_t *)memblock_alloc(PAGE_SIZE, PAGE_SIZE);
++		pgd_populate(pgdp, pudp);
++	}
++
++	/*
++	 * Step 2: Navigate to the PUD entry.
++	 * pud_offset reads the PGD entry, extracts the PUD base address,
++	 * and indexes into it with the next 9 bits of EA.
++	 */
++	pudp = pud_offset(pgdp, ea);
++	if (pud_none(*pudp)) {
++		/* PUD entry is empty - allocate a PMD Table page */
++		pmdp = (pmd_t *)memblock_alloc(PAGE_SIZE, PAGE_SIZE);
++		pud_populate(pudp, pmdp);
++	}
++
++	/*
++	 * Step 3: Navigate to the PMD entry (next 9 bits of EA).
++	 */
++	pmdp = pmd_offset(pudp, ea);
++	if (!pmd_present(*pmdp)) {
++		/* PMD entry is empty - allocate a PTE Table page */
++		ptep = (pte_t *)memblock_alloc(PAGE_SIZE, PAGE_SIZE);
++		pmd_populate(pmdp, ptep);
++	}
++
++	/*
++	 * Step 4: Navigate to the final PTE slot (next 5 bits of EA).
++	 */
++	ptep = pte_offset(pmdp, ea);
++	/*
++	 * Step 5: Install the leaf PTE.
++	 * pfn_pte creates the PTE value: RPN | protection bits | Leaf flag
++	 */
++	set_pte_at(ea, ptep, pfn_pte(pfn, prot));
++
++	/* Ensure the PTE is visible to the hardware */
++	asm volatile("ptesync" : : : "memory");
++	return 0;
++}
++
++
++/* ============================================================
++ * Section: radix_mmu_init() - Main initialization entry point
++ * ============================================================
++ */
++void radix_mmu_init(void)
++{
++	uint64_t paddr_start, paddr_end;
++	pgprot_t prot = PAGE_KERNEL_X;
++	uint64_t addr;
++
++	printk("\n=== Radix MMU Initialization ===\n");
++
++	/*
++	 * Step 1: Allocate the root Page Global Directory (PGD).
++	 *
++	 * The PGD is the root of our 4-level page table tree.
++	 * It has MAX_PTRS_PER_PGD (8192) entries, each 8 bytes = 64KB total.
++	 *
++	 * We allocate it at a physical address, then store the VIRTUAL
++	 * address in k_pgd (so we can access it directly from C code).
++	 * The hardware tables store the PHYSICAL address.
++	 */
++	k_pgd = (pgd_t *) memblock_alloc(
++				MAX_PTRS_PER_PGD * sizeof(pgd_t),
++				MAX_PTRS_PER_PGD * sizeof(pgd_t));
++
++	/* Convert to virtual address for our use */
++	k_pgd = (pgd_t *) __va((uint64_t)k_pgd);
++	printk("  k_pgd: 0x%x (VA)\n", (uint64_t)k_pgd);
++
++	/*
++	 * Step 2: Set up partition and process tables.
++	 * These tell the hardware about our page table root.
++	 */
++	radix_setup_tables();
++
++	/*
++	 * Step 3: Map the kernel code/data.
++	 *
++	 * Map every 64KB page from _start to _end:
++	 *   Radix implements a 2 level translation.
++	 *   Virtual address  = PA | 0xC000000000000000 (quadrant 3)
++	 *   Physical address = PA
++	 *   Permissions      = read/write/execute (kernel code)
++	 */
++	paddr_start = (uint64_t)&_start;
++	paddr_end = ALIGN_UP((uint64_t)&_end, PAGE_SIZE);
++	prot = PAGE_KERNEL_X;
++
++	printk("  mapping kernel: PA 0x%x - 0x%x to VA 0x%x - 0x%x\n",
++			paddr_start, paddr_end
++			,__va(paddr_start), __va(paddr_end));
++
++	for (addr = paddr_start; addr < paddr_end; addr += PAGE_SIZE) {
++		uint64_t eaddr = __va(addr);
++		map_kernel_page(eaddr, addr, prot, PAGE_SIZE);
++	}
++
++	/*
++	 * Step 4: Map the UART MMIO region.
++	 *
++	 * The serial console lives at LPC_BASE. We must map it so
++	 * printk continues to work after we enable the MMU.
++	 * Without this mapping, the first uart_putc after MMU-on
++	 * would cause a Data Storage Interrupt (page fault).
++	 */
++	paddr_start = LPC_BASE;
++	paddr_end = ALIGN_UP(paddr_start + PAGE_SIZE, PAGE_SIZE);
++
++	printk("  mapping UART:   PA 0x%x - 0x%x to VA 0x%x - 0x%x\n",
++			paddr_start, paddr_end,
++			__va(paddr_start), __va(paddr_end));
++
++	for (addr = paddr_start; addr < paddr_end; addr += PAGE_SIZE) {
++		uint64_t eaddr = __va(addr);
++		map_kernel_page(eaddr, addr, prot, PAGE_SIZE);
++	}
++
++	/*
++	 * Let's also map the memblock region so far and keep a buffer of
++	 * 10 extra PAGE_SIZE page for future experiments of allocating a page
++	 * beyond memblock etc.
++	 * Ideally we should map the entire DRAM size.
++	 * TODO: Make a way to pass the DRAM size in the code so that we can map
++	 * upto the entire DRAM size.
++	 */
++	paddr_start = ALIGN_UP((uint64_t)&_end, PAGE_SIZE);
++	paddr_end = ALIGN_UP(memblock_end + 10 * PAGE_SIZE, PAGE_SIZE);
++	prot = PAGE_KERNEL;
++
++	printk("  mapping memblock: PA 0x%x - 0x%x to VA 0x%x - 0x%x\n",
++			paddr_start, paddr_end
++			,__va(paddr_start), __va(paddr_end));
++
++	for (addr = paddr_start; addr < paddr_end; addr += PAGE_SIZE) {
++		uint64_t eaddr = __va(addr);
++		map_kernel_page(eaddr, addr, prot, PAGE_SIZE);
++	}
++
++	/*
++	 * Step 5: Synchronize.
++	 * Ensure all page table writes are visible before enabling the MMU.
++	 *
++	 * eieio  - Enforce In-Order Execution of I/O
++	 * tlbsync - Wait for all TLB operations to complete
++	 * ptesync - Wait for all page table updates to be visible
++	 * isync   - Context-synchronizing: flush instruction pipeline
++	 */
++	asm volatile("eieio; tlbsync; ptesync" : : : "memory");
++	asm volatile("isync" ::: "memory");
++
++	printk("  page tables built successfully\n");
++}
+diff --git a/radix-mmu.h b/radix-mmu.h
+new file mode 100644
+index 0000000..ca6fc09
+--- /dev/null
++++ b/radix-mmu.h
+@@ -0,0 +1,188 @@
++#ifndef _RADIX_MMU_H
++#define _RADIX_MMU_H
++
++/*
++ * radix-mmu.h: Defines radix mmu related macros and HW bit definitions.
++ *
++ */
++
++/*
++ * Radix page table index sizes for 64KB pages.
++ *
++ * The 4 levels split the virtual address as:
++ *   PGD: 13 bits - 8192 entries × 8 bytes = 64KB table
++ *   PUD:  9 bits -  512 entries × 8 bytes =  4KB table
++ *   PMD:  9 bits -  512 entries × 8 bytes =  4KB table
++ *   PTE:  5 bits -   32 entries × 8 bytes =  256B table
++ *
++ *  63  62 61   52                   39            30            21        16              0
++ * +------+-------+--------------------+-------------+-------------+---------+--------------+
++ * |  Top |       |    PGD index       |  PUD index  |  PMD index  |PTE index| Page Offset  |
++ * |  2b  |       |      13 bits       |   9 bits    |   9 bits    | 5 bits  |    16 bits   |
++ * +------+-------+--------------------+-------------+-------------+---------+--------------+
++ *                  8192 entries          512 entries   512 entries  32 entries   64KB page
++ *                  64KB table            4KB table     4KB table    256B table
++ *
++ * Total indexed bits: 13 + 9 + 9 + 5 = 36
++ * Plus page offset:   16 bits (64KB pages)
++ * Total:              52 bits of effective address
++ * Reference: arch/powerpc/include/asm/book3s/64/radix-64k.h (Linux)
++ */
++
++/*
++ * For 64K page size supported index is 13/9/9/5
++ * 1 PMD entry points to a PTE table which has 5 index entries.
++ * Each pte entry maps a 64K size page.
++ * So 2^5 * 64K = 2MB => that means 1 PMD entry maps to 1 PTE page table which
++ * maps a 2MB region or (2MB hugepage).
++ */
++#define RADIX_PTE_INDEX_SIZE   5  // size: 8B <<  5 = 256B, maps 2^5  x   64K =   2MB
++#define RADIX_PMD_INDEX_SIZE   9  // size: 8B <<  9 =  4KB, maps 2^9  x   2MB =   1GB
++#define RADIX_PUD_INDEX_SIZE   9  // size: 8B <<  9 =  4KB, maps 2^9  x   1GB = 512GB
++#define RADIX_PGD_INDEX_SIZE  13  // size: 8B << 13 = 64KB, maps 2^13 x 512GB =   4PB
++
++/*
++ * Non-leaf (directory) entry (PDE) bits.
++ *
++ *  0    1   2   3                            55 56    58 59      63
++ * +---+---+---+---+----------------------------+--------+---------+
++ * | V | L |SW | / |            NLB             |   ///  |   NLS   |
++ * +---+---+---+---+----------------------------+--------+---------+
++ *
++ * A non-leaf entry in the page table contains:
++ *   - Bit 0 (Valid): must be 1, (0x8000000000000000) is the Valid bit
++ *   - Bit 4:55	 NLB: Next Level Base (real address of next-level table)
++ *   - Bit 59:63 NLS: Next Level Size (size of next level table is 2^(NLS+3)), NLS ≥ 5
++ *
++ * The low bits encode the Next Level Size (how many bits to index
++ * into the next table).
++ */
++#define RADIX_PMD_VAL_BITS	(0x8000000000000000ULL | RADIX_PTE_INDEX_SIZE)
++#define RADIX_PUD_VAL_BITS	(0x8000000000000000ULL | RADIX_PMD_INDEX_SIZE)
++#define RADIX_PGD_VAL_BITS	(0x8000000000000000ULL | RADIX_PUD_INDEX_SIZE)
++
++/*
++ * Radix PTE permission/attribute bits.
++ *
++ * These are defined by the Power ISA for leaf page table entries:
++ *
++ *  0   1   2   3  6 7                  51 52 54 55 56 57 58 59 60     63
++ * +---+---+---+----+---------------------+-----+--+--+--+----+---------+
++ * | V | L |sw |  / |         RPN         |  sw | R| C| /| ATT|   EAA   |
++ * +---+---+---+----+---------------------+-----+--+--+--+----+---+-----+
++ *
++ *
++ * Bit layout of a Radix PTE (64 bits):
++ *   [0]     Valid (V)		- entry is valid
++ *   [1]     Leaf (L)		- this is a PTE (not a pointer to next level)
++ *   [2]     SW			- SW bit 0 (available for software use)
++ *   [7:51]  RPN		- Real (Physical) Page Number
++ *   [52:54] SW			- SW bits 1:3 (available for software use)
++ *   [55]    Reference (R)	- hardware sets this when page is accessed
++ *   [56]    Change (C)		- hardware sets this when page is written
++ *   [60]    Privileged		- 0=problem state permitted, 1=privileged only
++ *   [61]    Read		- read permission
++ *   [62]    Read/Write		- write permission
++ *   [63]    Execute		- execute permission
++ */
++#define _PAGE_PRESENT		(1ULL << (63 - 0))	/* Valid */
++#define _PAGE_PTE		(1ULL << (63 - 1))	/* Leaf PTE */
++#define _PAGE_ACCESSED		(1ULL << (63 - 55))	/* Referenced */
++#define _PAGE_DIRTY		(1ULL << (63 - 56))	/* Changed/Dirty */
++#define _PAGE_PRIVILEGED	(1ULL << (63 - 60))	/* Privileged access only */
++#define _PAGE_READ		(1ULL << (63 - 61))	/* Read access */
++#define _PAGE_WRITE		(1ULL << (63 - 62))	/* Write access */
++#define _PAGE_EXEC		(1ULL << (63 - 63))	/* Execute access */
++
++/*
++ * Linux uses _PAGE_INVALID along with _PAGE_PRESENT to check if pmd_present
++ * is true.
++ * I think it gets used while splitting of a PMD page.
++ * Because we are not implementing that, we need not use _PAGE_INVALID,
++ * but let's still define it.
++ */
++#define _RPAGE_SW0		0x2000000000000000UL
++#define _PAGE_INVALID		_RPAGE_SW0
++
++/*
++ * Compound permission macros:
++ *   PAGE_KERNEL   - read/write, privileged, no execute
++ *   PAGE_KERNEL_X - read/write/execute, privileged (for kernel code)
++ */
++#define PAGE_KERNEL \
++	__pgprot(_PAGE_PRESENT | _PAGE_ACCESSED | _PAGE_PRIVILEGED | \
++		 _PAGE_READ | _PAGE_WRITE | _PAGE_DIRTY)
++
++#define PAGE_KERNEL_X \
++	__pgprot(_PAGE_PRESENT | _PAGE_ACCESSED | _PAGE_PRIVILEGED | \
++		 _PAGE_READ | _PAGE_WRITE | _PAGE_DIRTY | _PAGE_EXEC)
++
++
++/*
++ * Kernel virtual address offset.
++ *
++ * We map the kernel at VA = PA | 0xC000000000000000.
++ * The top 2 bits (11) select Quadrant 3, which is the kernel quadrant
++ * on POWER9 Radix. Quadrant 3 uses the partition table entry directly
++ * (no process table / PID lookup).
++ *
++ * __va(pa) - physical to virtual: set the top 2 bits
++ * __pa(va) - virtual to physical: clear the top 4 bits
++ */
++#define PAGE_OFFSET	((uint64_t)0xc000000000000000ULL)
++#define __va(x)		((uint64_t)((x) | PAGE_OFFSET))
++#define __pa(x)		((uint64_t)(x) & 0x0fffffffffffffffULL)
++
++/* Page Size definitions and shift */
++#define PAGE_SIZE_64K	65536
++#define PAGE_SIZE_4K	4096
++#define PAGE_SIZE	PAGE_SIZE_64K 	/* default using 64K pagesize */
++#define PAGE_SHIFT	16
++
++/* ============================================================
++ * Section: Special Purpose Register (SPR) access
++ *
++ * SPRs are hardware configuration registers accessed via mfspr/mtspr
++ * instructions. We use inline assembly with the __stringify trick
++ * to embed the SPR number as an immediate in the instruction.
++ * ============================================================
++ */
++
++#define __stringify_1(x)	#x
++#define __stringify(x)		__stringify_1(x)
++
++/* Read an SPR - returns its 64-bit value */
++#define mfspr(rn)	({ uint64_t rval; \
++	asm volatile("mfspr %0," __stringify(rn) : "=r"(rval)); rval; })
++
++/* Write a 64-bit value to an SPR */
++#define mtspr(rn, v)	asm volatile("mtspr " __stringify(rn) ",%0" : \
++	: "r"((uint64_t)(v)) : "memory")
++
++/* SPR numbers we need */
++#define SPRN_PTCR	0x1D0	/* Partition Table Control Register */
++#define SPRN_PID	0x030	/* Process ID */
++#define SPRN_LPCR	0x13E	/* LPAR Control Register */
++#define SPRN_LPID	0x13F	/* Logical Partition Identifier */
++
++/*
++ * LPCR bits:
++ *   HR (Host Radix)   - tells hardware the hypervisor uses Radix MMU
++ *   UPRT (Use Process Table) - tells hardware to use the process table
++ */
++#define LPCR_UPRT	(1ULL << (63 - 41))
++#define LPCR_HR		(1ULL << (63 - 43))
++
++
++/*
++ * radix_mmu.h - Radix MMU public interface
++ *
++ * These are the two functions called from main.c:
++ *   radix_mmu_init()   - Set up all page tables and hardware registers
++ *   radix_mmu_enable() - Turn on address translation (set MSR[IR|DR])
++ */
++extern void radix_mmu_init(void);
++extern void radix_mmu_enable(void);
++
++
++#endif
+-- 
+2.39.5
+

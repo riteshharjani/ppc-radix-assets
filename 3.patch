@@ -1,0 +1,423 @@
+From 181e5b6bdc1a0edfbe155b786fd8f82e036bd4bf Mon Sep 17 00:00:00 2001
+Message-Id: <181e5b6bdc1a0edfbe155b786fd8f82e036bd4bf.1771142402.git.ritesh.list@gmail.com>
+In-Reply-To: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+References: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+From: Ritesh Harjani <ritesh.list@gmail.com>
+Date: Sun, 15 Feb 2026 12:53:06 +0530
+Subject: [RFC v1 3/8] radix-kernel/chapter3: Add support for UART and printk
+
+Add serial console output capability:
+- uart.h: UART interface, LPC_BASE address for powernv9
+- uart.c: 16550 UART driver (polling-based MMIO) & printk support with format
+  specifiers (%c, %d, %u, %x, %p, %s, %lld, %llu)
+- main.c: updated k_main to print hello message and test formats
+- build.sh: compile and link uart.c
+
+~> ./run.sh
+Starting QEMU (paused, waiting for GDB on port 1234)...
+  To connect GDB:  ./gdb.sh
+  To quit QEMU:    Ctrl-B then x
+  To enter QEMU monitor:    Ctrl-B then c
+
+hello ppc-radix-kernel
+We are running on Qemu bare-metal Power9
+decimal: 3
+hex: 0xdeadbeef
+string: it works!
+
+Signed-off-by: Ritesh Harjani <ritesh.list@gmail.com>
+---
+ build.sh |   5 +-
+ main.c   |  13 +++
+ uart.c   | 246 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ uart.h   |  75 +++++++++++++++++
+ 4 files changed, 338 insertions(+), 1 deletion(-)
+ create mode 100644 uart.c
+ create mode 100644 uart.h
+
+diff --git a/build.sh b/build.sh
+index d8062ce..c667fdb 100755
+--- a/build.sh
++++ b/build.sh
+@@ -38,13 +38,16 @@ echo "  [AS]  boot.S"
+ ${CROSS_COMPILE}gcc -c -g -mregnames -o boot.o boot.S
+ 
+ # Step 2: Compile C source files
++echo "  [CC]  uart.c"
++${CROSS_COMPILE}gcc -c uart.c -o uart.o -I${INCLUDE_PATH} ${CFLAGS}
++
+ echo "  [CC]  main.c"
+ ${CROSS_COMPILE}gcc -c main.c -o main.o -I${INCLUDE_PATH} ${CFLAGS}
+ 
+ # Step 3: Link everything using our linker script
+ # -T link.lds specifies our custom linker script
+ echo "  [LD]  kernel.elf"
+-${CROSS_COMPILE}ld -T link.lds -o kernel.elf boot.o main.o
++${CROSS_COMPILE}ld -T link.lds -o kernel.elf boot.o main.o uart.o
+ 
+ # Step 4: Extract raw binary from ELF
+ # objcopy -O binary strips all ELF headers and produces a flat binary.
+diff --git a/main.c b/main.c
+index 1fd2b4f..b8609c0 100644
+--- a/main.c
++++ b/main.c
+@@ -7,10 +7,23 @@
+  * this works by attaching GDB and checking that we reach k_main.
+  *
+  * Next we will add serial output in Chapter 3.
++ *
++ * Chapter3: adds uart serial driver to our radix mmu based kernel and
++ * adds some printk in this k_main to see how it works.
+  */
+ 
++#include "uart.h"
++
+ void k_main(void)
+ {
++
++	printk("hello ppc-radix-kernel\n");
++	printk("We are running on Qemu bare-metal Power9\n");
++
++	printk("decimal: %d\n", 3);
++	printk("hex: 0x%x\n", 0xdeadbeef);
++	printk("string: %s\n", "it works!");
++
+ 	/*
+ 	 * Nothing to do yet - just spin.
+ 	 *
+diff --git a/uart.c b/uart.c
+new file mode 100644
+index 0000000..91a0c86
+--- /dev/null
++++ b/uart.c
+@@ -0,0 +1,246 @@
++/*
++ * uart.c: UART serial console driver
++ *
++ * This implements a polling based UART driver for 16550-compatible serial port
++ * available in Qemu.
++ *
++ * How MMIO (memory mapped I/O) works:
++ *   We use mmio based reads/writes to the registers (unlike X86 where
++ *   architecture provides special instruction to cpu for reads/writes like "in"
++ *   & "out"). We use device registers to read and writes to them.
++ *
++ *   We use volatile pointers to ensure compiler does not caches the value of
++ *   this register and never touches the hardware.
++ *
++ * 16550 UART register details:
++ *   THR (Transmit Holding Register): write a byte here to send it.
++ *   RBR (Receive Buffer Register): read a byte from here to receive it.
++ *   LSR (Line Status Register): check if TX or RX is ready to send or receive.
++ *   THR and RBR are the same address (offset 0x0), reads=RBR and writes=THR
++ */
++
++#include "uart.h"
++#include <stdint.h>
++#include <stdarg.h>
++
++/*
++ * MMIO read/write helpers.
++ *
++ * These cast an integer address to a volatile pointer and dereference it.
++ * The volatile qualifier tells the compiler that:
++ *    This memory location can change at any time (it's a hardware register).
++ *    Do not cache, reorder, or optimize away accesses to it.
++ */
++static inline uint8_t mmio_read8(uint64_t addr)
++{
++	return *(volatile uint8_t *)addr;
++}
++
++static inline void mmio_write8(uint64_t addr, uint8_t val)
++{
++	*(volatile uint8_t *)addr = val;
++}
++
++/*
++ * uart_init:  Initialize the UART
++ *
++ * On QEMU, the UART is pre-configured and ready to use.
++ * On real hardware, you'd set baud rate, parity, etc. here.
++ */
++void uart_init(void)
++{
++	/* Nothing needed for QEMU - UART is ready at boot */
++}
++
++/*
++ * uart_putc: Send one character over the serial line
++ *
++ * We must wait until the transmitter is ready (THR is empty)
++ * before writing. This is "polling" - we spin in a loop checking
++ * the LSR register until the THRE bit is set.
++ *
++ * On real hardware, you might use interrupts instead of polling.
++ */
++void uart_putc(char c)
++{
++	/* Spin until the transmit buffer is empty */
++	while (!(mmio_read8(UART_LSR) & UART_LSR_THRE))
++		;
++
++	/* Write the character to the Transmit Holding Register */
++	mmio_write8(UART_THR, c);
++}
++
++/*
++ * uart_getc: Receive one character from the serial line
++ *
++ * Blocks (spins) until a byte is available in the receive buffer.
++ */
++char uart_getc(void)
++{
++	/* Spin until data is ready */
++	while (!(mmio_read8(UART_LSR) & UART_LSR_DR))
++		;
++
++	return mmio_read8(UART_RBR);
++}
++
++/*
++ * uart_puts: Send a null-terminated string
++ */
++void uart_puts(const char *str)
++{
++	while (*str)
++		uart_putc(*str++);
++}
++
++/*
++ * getchar: Convenience wrapper for uart_getc
++ */
++char getchar(void)
++{
++	return uart_getc();
++}
++
++/*
++ * itoa: Convert an unsigned integer to a string in the given base
++ *
++ * We implement this ourselves because we have no libc.
++ * Supports bases 2-16 (we only use 10 and 16).
++ */
++static void itoa(char *buf, uint64_t num, int base)
++{
++	char digits[] = "0123456789abcdef";
++	char *ptr = buf;
++	uint64_t temp = num;
++
++	/* Convert digits in reverse order */
++	do {
++		*ptr++ = digits[temp % base];
++		temp /= base;
++	} while (temp);
++
++	/* Reverse the string in-place */
++	for (char *p1 = buf, *p2 = ptr - 1; p1 < p2; p1++, p2--) {
++		char tmp = *p1;
++		*p1 = *p2;
++		*p2 = tmp;
++	}
++	*ptr = '\0';
++}
++
++/*
++ * printk: Kernel printf
++ *
++ * A simplified printf for bare-metal use. Supports:
++ *   %c  - character
++ *   %d  - signed decimal integer
++ *   %u  - unsigned decimal integer
++ *   %x  - unsigned hex (no "0x" prefix)
++ *   %p  - pointer (prints "0x" prefix + hex)
++ *   %s  - null-terminated string
++ *   %lld - signed 64-bit integer
++ *   %llu - unsigned 64-bit integer
++ *
++ * This uses C99 variadic functions:
++ *   va_start(args, fmt) - initialize the argument list
++ *   va_arg(args, type)  - get the next argument of the given type
++ *   va_end(args)        - cleanup
++ *
++ * These are provided by <stdarg.h>, which is a compiler builtin header
++ * (not part of libc), so it's available even with -ffreestanding.
++ */
++void printk(const char *fmt, ...)
++{
++	char num_buf[64];
++	const char *p;
++	va_list args;
++
++	va_start(args, fmt);
++
++	for (p = fmt; *p != '\0'; p++) {
++		if (*p != '%') {
++			uart_putc(*p);
++			continue;
++		}
++
++		switch (*++p) {
++		case 'c': {
++			/* %c - char is promoted to int in varargs */
++			char ch = (char)va_arg(args, int);
++			uart_putc(ch);
++			break;
++		}
++		case 'd': {
++			/* %d - signed int */
++			int num = va_arg(args, int);
++			if (num < 0) {
++				uart_putc('-');
++				num = -num;
++			}
++			itoa(num_buf, num, 10);
++			uart_puts(num_buf);
++			break;
++		}
++		case 'u': {
++			/* %u - unsigned int */
++			unsigned int num = va_arg(args, unsigned int);
++			itoa(num_buf, num, 10);
++			uart_puts(num_buf);
++			break;
++		}
++		case 'l': {
++			/* %lld or %llu - 64-bit integers */
++			if (*(p + 1) == 'l') {
++				p++;  /* skip 'l' */
++				p++;  /* move to 'd' or 'u' */
++				if (*p == 'd') {
++					long long num = va_arg(args, long long);
++					if (num < 0) {
++						uart_putc('-');
++						num = -num;
++					}
++					itoa(num_buf, num, 10);
++					uart_puts(num_buf);
++				} else if (*p == 'u') {
++					unsigned long long num = va_arg(args, unsigned long long);
++					itoa(num_buf, num, 10);
++					uart_puts(num_buf);
++				}
++			}
++			break;
++		}
++		case 'x': {
++			/* %x - unsigned hex */
++			uint64_t num = va_arg(args, uint64_t);
++			itoa(num_buf, num, 16);
++			uart_puts(num_buf);
++			break;
++		}
++		case 'p': {
++			/* %p - pointer (with 0x prefix) */
++			uint64_t num = va_arg(args, uint64_t);
++			uart_puts("0x");
++			itoa(num_buf, num, 16);
++			uart_puts(num_buf);
++			break;
++		}
++		case 's': {
++			/* %s - string */
++			const char *str = va_arg(args, const char *);
++			if (str)
++				uart_puts(str);
++			else
++				uart_puts("(null)");
++			break;
++		}
++		default:
++			/* Unknown format - print literally */
++			uart_putc('%');
++			uart_putc(*p);
++			break;
++		}
++	}
++
++	va_end(args);
++}
+diff --git a/uart.h b/uart.h
+new file mode 100644
+index 0000000..7cfa3bd
+--- /dev/null
++++ b/uart.h
+@@ -0,0 +1,75 @@
++#ifndef _UART_PPC_H
++#define _UART_PPC_H
++
++/*
++ * uart.h: UART serial console interface
++ *
++ * UART will be our I/O device. It comes in very helpful to have a way to print
++ * on the serial console. This allows us to debug things very easily.
++ *
++ * Details about this UART device is taken from study of Qemu code. On Qemu
++ * powernv9 machine, the UART is accessed through the LPC bus (Low Pin Count)
++ * at the physical address = 0x0006_0300_d001_0000
++ *
++ * This info was derived from Qemu device tree running powernv9. The Qemu
++ * monitor command 'info mtree' shows:
++ *   00000000d0010000-00000000d001ffff (prio 0, i/o): LPC
++ *
++ * The 0x600300... prefix address is the LPC bus base.
++ *
++ * info mtree details:
++ *
++ * address-space: cpu-memory-0
++ * address-space: memory
++ *   0000000000000000-ffffffffffffffff (prio 0, i/o): system
++ *     0000000000000000-000000003fffffff (prio 0, ram): pnv.ram
++ *     0000000002000000-00000000027fffff (prio 0, ram): pnv.mtd
++ *     0000203ffd800000-0000203ffdbfffff (prio 0, ram): homer-chip0-memory
++ *     0000203fffd80000-0000203fffda57ff (prio 0, i/o): occ-common-area
++ *     0006030000000000-00060300ffffffff (prio 0, i/o): lpcm
++ *     0006030203000000-00060302030fffff (prio 0, i/o): psihb
++ *     000603fc00000000-000603ffffffffff (prio 0, i/o): xscom-0
++ *  ....
++ * address-space: lpc-opb
++ *   0000000000000000-00000000ffffffff (prio 0, i/o): lpc-opb
++ *     00000000c0010000-00000000c001005f (prio 0, i/o): lpc-opb-master
++ *     00000000c0012000-00000000c00120ff (prio 0, i/o): lpc-hc
++ *     00000000d0010000-00000000d001ffff (prio 0, i/o): alias lpc-isa-io @isa-io 0000000000000000-000000000000ffff
++ *     00000000e0000000-00000000efffffff (prio 0, i/o): alias lpc-isa-mem @isa-mem 0000000000000000-000000000fffffff
++ *     00000000f0000000-00000000ffffffff (prio 0, i/o): alias lpc-isa-fw @isa-fw 0000000000000000-000000000fffffff
++ *     ...
++ * memory-region: isa-io
++ *   0000000000000000-000000000000ffff (prio 0, i/o): isa-io
++ *     0000000000000070-0000000000000071 (prio 0, i/o): rtc
++ *       0000000000000070-0000000000000070 (prio 0, i/o): rtc-index
++ *     00000000000000e4-00000000000000e7 (prio 0, i/o): ipmi-bt
++ *     00000000000003f8-00000000000003ff (prio 0, i/o): serial
++ */
++
++#define LPC_BASE 	(0x60300d0010000ULL)
++#define UART_BASE	(LPC_BASE + 0x3f8)
++#define UART_THR	(UART_BASE)		/* Transmit Holding Register */
++#define UART_RBR	(UART_BASE)		/* Receive Buffer Register */
++#define UART_LSR	(UART_BASE + 0x5)	/* Line Status Register */
++
++/* LSR bit masks */
++#define UART_LSR_THRE	0x20	/* Transmitter Holding Register Empty */
++#define UART_LSR_DR	0x01	/* Data Ready (byte received) */
++
++/* UART function interface definitions */
++extern void uart_init();
++extern char uart_getc();
++extern void uart_putc(char);
++extern void uart_puts(const char *s);
++extern char getchar(void);
++
++/*
++ * Since this is our kernel, we will also define printk
++ * supporting:
++ * %c, %d, %u, %x, %p, %s, %lld, %llu
++ * No support for floating point.
++ */
++extern void printk(const char *fmt, ...);
++
++#endif /* _UART_PPC_H */
++
+-- 
+2.39.5
+

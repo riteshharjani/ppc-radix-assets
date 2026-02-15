@@ -1,0 +1,22 @@
+From 7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6 Mon Sep 17 00:00:00 2001
+Message-Id: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+From: "Ritesh Harjani" <ritesh.list@gmail.com>
+Date: Sun, 15 Feb 2026 12:48:08 +0530
+Subject: [RFC v1 1/8] README: Add a README file
+
+Signed-off-by: Ritesh Harjani <ritesh.list@gmail.com>
+---
+ README.md | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..b1f6b20
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1 @@
++Let's get started!!
+--
+2.39.5
+

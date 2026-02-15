@@ -1,0 +1,250 @@
+From 7367aa45723737fafc8fd59f8ea04cbd7b5ba990 Mon Sep 17 00:00:00 2001
+Message-Id: <7367aa45723737fafc8fd59f8ea04cbd7b5ba990.1771142402.git.ritesh.list@gmail.com>
+In-Reply-To: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+References: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+From: Ritesh Harjani <ritesh.list@gmail.com>
+Date: Sun, 15 Feb 2026 12:53:14 +0530
+Subject: [RFC v1 4/8] radix-kernel/chapter4: Implement simple memory block
+ allocator
+
+Add a simple allocator:
+- memblock.h: allocator interface, ALIGN_UP macro, linker symbol externs
+- memblock.c: simple allocator with zero-filled, custom memset
+- main.c: shows allocations with different sizes/alignments
+- build.sh: compile and link memblock.c
+
+Output:
+root-> ./run.sh
+Starting QEMU (paused, waiting for GDB on port 1234)...
+  To connect GDB:  ./gdb.sh
+  To quit QEMU:    Ctrl-B then x
+  To enter QEMU monitor:    Ctrl-B then c
+
+hello ppc-radix-kernel
+We are running on Qemu bare-metal Power9
+=== Memory Layout ===
+  _start: 0x0
+  _end:   0x30000
+
+memblock initialized
+  alloc 4KB  @ 0x30000
+  alloc 64KB @ 0x40000
+  alloc 256B @ 0x50000
+
+memblock test passed!
+
+Signed-off-by: Ritesh Harjani <ritesh.list@gmail.com>
+---
+ build.sh   |  6 ++++-
+ main.c     | 28 ++++++++++++++++++---
+ memblock.c | 71 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ memblock.h | 44 +++++++++++++++++++++++++++++++++
+ 4 files changed, 145 insertions(+), 4 deletions(-)
+ create mode 100644 memblock.c
+ create mode 100644 memblock.h
+
+diff --git a/build.sh b/build.sh
+index c667fdb..32cc052 100755
+--- a/build.sh
++++ b/build.sh
+@@ -38,16 +38,20 @@ echo "  [AS]  boot.S"
+ ${CROSS_COMPILE}gcc -c -g -mregnames -o boot.o boot.S
+ 
+ # Step 2: Compile C source files
++
+ echo "  [CC]  uart.c"
+ ${CROSS_COMPILE}gcc -c uart.c -o uart.o -I${INCLUDE_PATH} ${CFLAGS}
+ 
++echo "  [CC]  memblock.c"
++${CROSS_COMPILE}gcc -c memblock.c -o memblock.o -I${INCLUDE_PATH} ${CFLAGS}
++
+ echo "  [CC]  main.c"
+ ${CROSS_COMPILE}gcc -c main.c -o main.o -I${INCLUDE_PATH} ${CFLAGS}
+ 
+ # Step 3: Link everything using our linker script
+ # -T link.lds specifies our custom linker script
+ echo "  [LD]  kernel.elf"
+-${CROSS_COMPILE}ld -T link.lds -o kernel.elf boot.o main.o uart.o
++${CROSS_COMPILE}ld -T link.lds -o kernel.elf boot.o main.o uart.o memblock.o
+ 
+ # Step 4: Extract raw binary from ELF
+ # objcopy -O binary strips all ELF headers and produces a flat binary.
+diff --git a/main.c b/main.c
+index b8609c0..dc7d4e6 100644
+--- a/main.c
++++ b/main.c
+@@ -10,9 +10,12 @@
+  *
+  * Chapter3: adds uart serial driver to our radix mmu based kernel and
+  * adds some printk in this k_main to see how it works.
++ *
++ * Chapter4: Adds simple memory allocator.
+  */
+ 
+ #include "uart.h"
++#include "memblock.h"
+ 
+ void k_main(void)
+ {
+@@ -20,9 +23,28 @@ void k_main(void)
+ 	printk("hello ppc-radix-kernel\n");
+ 	printk("We are running on Qemu bare-metal Power9\n");
+ 
+-	printk("decimal: %d\n", 3);
+-	printk("hex: 0x%x\n", 0xdeadbeef);
+-	printk("string: %s\n", "it works!");
++	/* Show the kernel memory layout */
++	printk("=== Memory Layout ===\n");
++	printk("  _start: 0x%x\n", (uint64_t)&_start);
++	printk("  _end:   0x%x\n", (uint64_t)&_end);
++
++	/* Initialize the memory allocator */
++	memblock_init();
++	printk("\nmemblock initialized\n");
++
++	/* Test some allocations: 4KB, 4KB-aligned */
++	uint64_t a1 = memblock_alloc(4096, 4096);
++	printk("  alloc 4KB  @ 0x%x\n", a1);
++
++	/* 64KB, 64KB-aligned */
++	uint64_t a2 = memblock_alloc(65536, 65536);
++	printk("  alloc 64KB @ 0x%x\n", a2);
++
++	/* 256B, 256B-aligned */
++	uint64_t a3 = memblock_alloc(256, 256);
++	printk("  alloc 256B @ 0x%x\n", a3);
++
++	printk("\nmemblock test passed!\n");
+ 
+ 	/*
+ 	 * Nothing to do yet - just spin.
+diff --git a/memblock.c b/memblock.c
+new file mode 100644
+index 0000000..1460788
+--- /dev/null
++++ b/memblock.c
+@@ -0,0 +1,71 @@
++/*
++ * memblock.c: Simple memblock allcator.
++ *
++ * Working:
++ *   - Keep a pointer pointing to the next free address.
++ *   - On allocations, align up the pointer, zero fill and move forward.
++ *   - No free() implemented. memory never gets returned.
++ *
++ */
++
++#include "uart.h"
++#include "memblock.h"
++
++/* Current state of the allocator */
++uint64_t memblock_start;		/* First allocatable address */
++uint64_t memblock_end;			/* Next free address */
++uint64_t memblock_align = 65536;	/* Default alignment: 64KB */
++/*
++ * memset: Fill memory with a byte value
++ *
++ * We implement our own because we have no libc (we use -ffreestanding)
++ * This is needed to zero-fill allocated memory (e.g. page tables
++ * MUST be zeroed because otherwise, a non-zero entry means "page is mapped").
++ */
++static void *memset(void *s, uint64_t c, uint64_t n)
++{
++	unsigned char *p = s;
++	while (n--)
++		*p++ = (unsigned char)c;
++	return s;
++}
++
++/*
++ * memblock_alloc: Allocate "size" bytes with "align" alignment
++ *
++ * Returns the physical address of the allocated region.
++ * The region is zero-filled.
++ *
++ * How it works:
++ *   1. Round up memblock_end to the requested alignment
++ *   2. Zero-fill the allocated region
++ *   3. Move memblock_end past the allocation
++ *   4. Return the start address
++ *
++ * Example: memblock_alloc(65536, 65536) allocates one 64KB aligned page.
++ */
++uint64_t memblock_alloc(uint64_t size, uint64_t align)
++{
++	uint64_t addr = ALIGN_UP(memblock_end, align);
++
++	/* Zero-filled, as it is critical for page tables */
++	memset((void *)addr, 0x0, size);
++
++	/* Move the pointer */
++	memblock_end = addr + size;
++
++	return addr;
++}
++
++/*
++ * memblock_init: Initialize the allocator
++ *
++ * Sets the allocation start point to just past the kernel image.
++ * The linker provides _end (end of kernel, 64KB aligned).
++ * Initialize memblock_start and memblock_end.
++ */
++void memblock_init(void)
++{
++	memblock_start = ALIGN_UP((uint64_t)&_end, memblock_align);
++	memblock_end = memblock_start;
++}
+diff --git a/memblock.h b/memblock.h
+new file mode 100644
+index 0000000..2550031
+--- /dev/null
++++ b/memblock.h
+@@ -0,0 +1,44 @@
++#ifndef _MEMBLOCK_H
++#define _MEMBLOCK_H
++
++/*
++ * memblock.h: Simple memory alloctor.
++ * The name came from memblock allocator in linux kernel. memblock in Linux is
++ * basically used before the memory is given to buddy allocator. It's an early
++ * memory allocator which works on regions and uses simple tracking to track
++ * free and reserved regions.
++ *
++ * In this implementation, we won't implement freeing of the memory. Once the
++ * region is allocated it will forever stay, and we won't get the same region
++ * / memory range again. We will just maintain a single pointer which will move
++ * forward to the next free address. So no free() implemented, to keep it
++ * simple and focus on getting towards implementing radix mmu.
++ *
++ * Memory layout:
++ *
++ *   0x0         _start      Kernel code (.text)
++ *   ...         _end        End of kernel image (64KB-aligned)
++ *   ...         memblock -  Free memory starts here
++ *   0x4000000   __end       End of usable memory (64MB)
++ * This can be found in link.lds our linker script.
++ */
++
++typedef unsigned long long uint64_t;
++#define ALIGN_UP(x, align)	(((x) + ((align) - 1)) & ~((align) - 1))
++
++/*
++ * Linker-defined symbols.
++ * These are addresses, not variables - use &_start, &_end, &__end.
++ */
++extern void *_start;	/* Start of kernel image */
++extern void *_end;	/* End of kernel image (64KB-aligned) */
++extern void *__end;	/* End of usable memory (64MB) */
++
++/* Current state of the allocator */
++extern uint64_t memblock_start;		/* First allocatable address */
++extern uint64_t memblock_end;		/* Next free address */
++
++extern uint64_t memblock_alloc(uint64_t size, uint64_t align);
++extern void memblock_init();
++
++#endif
+-- 
+2.39.5
+

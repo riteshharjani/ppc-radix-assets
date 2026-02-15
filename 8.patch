@@ -1,0 +1,144 @@
+From e0880d266d7ec41b4a91d5857879c0242a41d6ca Mon Sep 17 00:00:00 2001
+Message-Id: <e0880d266d7ec41b4a91d5857879c0242a41d6ca.1771142402.git.ritesh.list@gmail.com>
+In-Reply-To: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+References: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+From: Ritesh Harjani <ritesh.list@gmail.com>
+Date: Sun, 15 Feb 2026 12:53:50 +0530
+Subject: [RFC v1 8/8] radix-kernel/excercise: Implement (cmd_protect) changing
+ memory protection
+
+following is implemented:
+1. protect <va>: cmd is added to cmds.c
+2. radix_protect_page() helper is implemented in radix-mmu.c
+   This is a placeholder for the actual implementation which is left
+   as an excercise.
+   But if implemented we can do things like these ;)
+
+<notice the cause of the second DSI>
+===================================
+ppc> read 0xdeadbeef
+Reading 8 bytes from VA 0xdeadbeef:
+!!! EXCEPTION: DSI (Data Storage Interrupt) at 0xdeadbeef !!!
+        DSISR:                  0x40000000
+        Faulting instruction:   0xc0000000000118d0
+        Cause: Translation not found (page not mapped)
+    Skipping faulting instruction (SRR0 += 4)
+    Returning from exception...
+
+0x0
+ppc> map 0xdeadbeef 0x2000000
+Mapping VA 0xdeadbeef -> PA 0x2000000
+Done. Use 'walk 0xdeadbeef' to verify.
+ppc> read 0xdeadbeef
+Reading 8 bytes from VA 0xdeadbeef: 0x0
+ppc> write 0xdeadbeef 0xcafebabe
+Writing 0xcafebabe to VA 0xdeadbeef
+Done.
+ppc> read 0xdeadbeef
+Reading 8 bytes from VA 0xdeadbeef: 0xcafebabe
+ppc> protect 0xdeadbeef
+Protecting (make RO) VA 0xdeadbeef
+Done
+ppc> read 0xdeadbeef
+Reading 8 bytes from VA 0xdeadbeef: 0xcafebabe
+ppc> write 0xdeadbeef 0x0
+Writing 0x0 to VA 0xdeadbeef
+
+!!! EXCEPTION: DSI (Data Storage Interrupt) at 0xdeadbeef !!!
+        DSISR:                  0xa000000
+        Faulting instruction:   0xc000000000011948
+        Cause: Protection fault (permission denied)
+    Skipping faulting instruction (SRR0 += 4)
+    Returning from exception...
+
+Done.
+ppc>
+
+Signed-off-by: Ritesh Harjani <ritesh.list@gmail.com>
+---
+ cmds.c      | 11 +++++++++++
+ radix-mmu.c | 19 +++++++++++++++++++
+ radix-mmu.h |  1 +
+ 3 files changed, 31 insertions(+)
+
+diff --git a/cmds.c b/cmds.c
+index 218e592..c95f66d 100644
+--- a/cmds.c
++++ b/cmds.c
+@@ -124,6 +124,7 @@ static void cmd_help(void)
+ 	printk("  read <va>		Read 8 bytes from a virtual address\n");
+ 	printk("  write <va> <val>	Write 8 bytes to a virtual address\n");
+ 	printk("  fault			Trigger a page fault (access unmapped memory)\n");
++	printk("  protect <va> 		Make a VA mapping as RO\n");
+ 	printk("  info			Show MMU register state\n");
+ 	printk("  help			Show this help\n");
+ 	printk("  quit			Halt the CPU\n");
+@@ -226,6 +227,13 @@ static void cmd_unmap(uint64_t va)
+ 	printk("Done.\n");
+ }
+ 
++static void cmd_protect(uint64_t va)
++{
++	printk("Protecting (make RO) VA 0x%x\n", va);
++	radix_protect_va(va);
++	printk("Done\n");
++}
++
+ static void cmd_read(uint64_t va)
+ {
+ 	printk("Reading 8 bytes from VA 0x%x: ", va);
+@@ -283,6 +291,9 @@ void repl(void)
+ 		} else if (strncmp(cmd, "unmap ", 6) == 0) {
+ 			const char *arg = skip_spaces(cmd + 6);
+ 			cmd_unmap(parse_hex(arg));
++		} else if (strncmp(cmd, "protect ", 8) == 0) {
++			const char *arg = skip_spaces(cmd + 8);
++			cmd_protect(parse_hex(arg));
+ 		} else if (strncmp(cmd, "read ", 5) == 0) {
+ 			const char *arg = skip_spaces(cmd + 5);
+ 			cmd_read(parse_hex(arg));
+diff --git a/radix-mmu.c b/radix-mmu.c
+index 5e24bed..c0038db 100644
+--- a/radix-mmu.c
++++ b/radix-mmu.c
+@@ -732,6 +732,25 @@ void radix_unmap_page(uint64_t va)
+ 	asm volatile("isync" ::: "memory");
+ }
+ 
++void radix_protect_va(uint64_t va)
++{
++	struct walk_result wr;
++	pgd_t *pgdp;
++	pud_t *pudp;
++	pmd_t *pmdp;
++	pte_t *ptep;
++	uint64_t old, new;
++
++	radix_walk_page_table(va, &wr);
++	if (wr.depth != 4) {
++		printk("    !!! No mapping found for the VA ");
++		printk(" 	'Use map <va> <pa>' to map first\n");
++		return;
++	}
++
++	printk("=== REMOVE ME AFTER IMPLEMENTING THIS ====\n");
++}
++
+ /*
+  * radix_print_info - Print MMU-related SPR values.
+  */
+diff --git a/radix-mmu.h b/radix-mmu.h
+index 4f72e9f..7c719a5 100644
+--- a/radix-mmu.h
++++ b/radix-mmu.h
+@@ -205,6 +205,7 @@ extern void radix_walk_page_table(uint64_t va, struct walk_result *r);
+ extern void radix_print_info();
+ extern void radix_map_page(uint64_t va, uint64_t pa);
+ extern void radix_unmap_page();
++extern void radix_protect_va(uint64_t va);
+ 
+ 
+ /*
+-- 
+2.39.5
+

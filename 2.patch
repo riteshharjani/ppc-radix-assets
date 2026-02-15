@@ -1,0 +1,518 @@
+From 1aa65a35f4237eeb185b21c6f9a357a45f2958e7 Mon Sep 17 00:00:00 2001
+Message-Id: <1aa65a35f4237eeb185b21c6f9a357a45f2958e7.1771142402.git.ritesh.list@gmail.com>
+In-Reply-To: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+References: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+From: Ritesh Harjani <ritesh.list@gmail.com>
+Date: Sun, 15 Feb 2026 12:52:28 +0530
+Subject: [RFC v1 2/8] radix-mmu/chapter 2: Boot, assembly, linker script,
+ build and run infrastructure
+
+This patch adds the bare metal boot up sequence:
+1. boot.S defines the entry point, exception vector stubs, stack / TOC
+   setup and jumps to C handler k_main.
+2. link.lds: defines the memory layout for .text, .got/.toc, 64KB stack,
+   _end symbol for the kernel image
+3. main.c: minimal C handler which defines k_main.
+4. build.sh: build infrastructure with some useful self explainatory
+   comments.
+5. run.sh: Quick run using ./run.sh
+6. gdb.sh: GDB remote debug helper. Quite useful for writing this.
+7. .gitignore
+
+At the end of this, we should be able to verify the r1 stack pointer,
+r2 TOC and that the code jumps and breaks at k_main.
+
+This is what the objdump shows:
+
+powerpc64-linux-gnu-objdump -D kernel.elf
+
+kernel.elf:     file format elf64-powerpc
+
+Disassembly of section .text:
+
+0000000000000000 <_start>:
+        ...
+      10:       48 00 ff f8     b       10008 <boot_entry>
+        ...
+     300:       48 00 fd 00     b       10000 <_exception_0x300>
+        ...
+     380:       48 00 fc 80     b       10000 <_exception_0x300>
+        ...
+     400:       48 00 fc 00     b       10000 <_exception_0x300>
+        ...
+     480:       48 00 fb 80     b       10000 <_exception_0x300>
+        ...
+     c00:       48 00 f4 00     b       10000 <_exception_0x300>
+        ...
+     e00:       48 00 f2 00     b       10000 <_exception_0x300>
+        ...
+     e20:       48 00 f1 e0     b       10000 <_exception_0x300>
+        ...
+     e40:       48 00 f1 c4     b       10004 <_exception_0xe40>
+        ...
+
+0000000000010000 <_exception_0x300>:
+   10000:       4c 00 00 24     rfid
+
+0000000000010004 <_exception_0xe40>:
+   10004:       4c 00 02 24     hrfid
+
+0000000000010008 <boot_entry>:
+   10008:       3c 20 00 03     lis     r1,3
+   1000c:       60 21 00 00     ori     r1,r1,0
+   10010:       3c 40 00 02     lis     r2,2
+   10014:       38 42 81 00     addi    r2,r2,-32512
+   10018:       48 00 00 09     bl      10020 <.k_main>
+   1001c:       48 00 00 00     b       1001c <boot_entry+0x14>
+
+0000000000010020 <.k_main>:
+   10020:       48 00 00 00     b       10020 <.k_main>
+        ...
+Signed-off-by: Ritesh Harjani <ritesh.list@gmail.com>
+---
+ .gitignore |   5 ++
+ boot.S     | 141 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ build.sh   |  57 ++++++++++++++++++++++
+ gdb.sh     |  25 ++++++++++
+ link.lds   |  87 +++++++++++++++++++++++++++++++++
+ main.c     |  26 ++++++++++
+ run.sh     |  44 +++++++++++++++++
+ 7 files changed, 385 insertions(+)
+ create mode 100644 .gitignore
+ create mode 100644 boot.S
+ create mode 100755 build.sh
+ create mode 100755 gdb.sh
+ create mode 100644 link.lds
+ create mode 100644 main.c
+ create mode 100755 run.sh
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..c579c9d
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++*.o
++kernel.elf
++kernel.bin
++qemu.log
++.assets
+diff --git a/boot.S b/boot.S
+new file mode 100644
+index 0000000..58ee885
+--- /dev/null
++++ b/boot.S
+@@ -0,0 +1,141 @@
++/*
++ * boot.S: PowerPC64 boot entry code
++ *
++ * This is the entry point to the baremetal code.
++ * PPC Qemu with -bios option sets NIP to 0x10.
++ * Hence we place our _start at 0x10 location.
++ *
++ * What boot.S does is:
++ * - Prepares the execution environment like stack and toc and quickly jumps to C.
++ * - Ensure that we have a exception handling stub written in case if an exception
++ *   happens while implementing this baremetal radix mmu.
++ *   These stubs are added to offsets defined by the Power ISA.
++ */
++
++.section ".text", "ax"
++
++/*
++ * _start: is the global text section where linker will link all our compiled
++ * .text from the .o files.
++ * Reason for putting _start the 1st instruction "b boot_entry" at 16 byte
++ * offset is because Qemu ppc with -bios option jumps to this offset on start
++ */
++
++.global _start
++_start:
++	. = 0x10
++	/* Directly jump to boot_entry label which prepares stack and toc */
++	b boot_entry
++
++
++/*
++ * Quick exception handler reference from: Section 7.5.1 of PowerISA 3.1C
++ * For now this just add simple stubs and a quick reference sheet.
++ *
++ * 0x100 - System Reset
++ * 0x200 - Machine Check
++ * 0x300 - Data Storage Interrupt (DSI): data access fault
++ * 0x380 - Data Segment Interrupt
++ * 0x400 - Instruction Storage Interrupt (ISI): instruction fetch fault
++ * 0x480 - Instruction Segment:
++ * 0x500 - External:
++ * 0x600 - Alignment:
++ * 0x700 - Program: Generally due to execution of higher Privileged instruction
++ * 0x900 - Decrementer:
++ * 0x980 - Hypervisor Decrementer:
++ * 0xA00 - Directed Privileged Doorbell:
++ * 0xc00 - System Call
++ * 0xd00 - Trace
++ * 0xe00 - Hypervisor Data Storage
++ * 0xe20 - Hypervisor Instruction Storage
++ * 0xe40 - Hypervisor Emulation Assistance
++ * 0xe60 - Hypervisor Maintenance
++ * 0xe80 - Directed Hypervisor Doorbell
++ * 0xeA0 - Hypervisor Virtualization
++ */
++
++#define EXCEPTION(nr)	\
++	. = nr;		\
++	b _exception_##nr
++
++	EXCEPTION(0x300)
++	EXCEPTION(0x380)
++	EXCEPTION(0x400)
++	EXCEPTION(0x480)
++	EXCEPTION(0xc00)
++	EXCEPTION(0xe00)
++	EXCEPTION(0xe20)
++	EXCEPTION(0xe40)
++
++	/*
++	 * Align to 64KB - all exception vector stubs go here.
++	 * This keeps the vector area (0x0 - 0xFFFF) clean,
++	 * and our actual handler code starts past it.
++	 */
++	. = 0x10000
++
++_exception_0x300:
++_exception_0x380:
++_exception_0x400:
++_exception_0x480:
++_exception_0xc00:
++	/*
++	 * rfid - Return From Interrupt Doubleword. This restores:
++	 * MSR <- SRR1
++	 * NIP <- SRR0
++	 */
++	rfid
++
++_exception_0xe00:
++_exception_0xe20:
++_exception_0xe40:
++	/*
++	 * hrfid - Hypervisor Return From Interrupt Doubleword.
++	 * Same as rfid but for hypervisor-level exceptions.
++	 * MSR <- HSRR1
++	 * NIP <- HSRR0
++	 */
++	hrfid
++
++/*
++ * Here we prepare the bare minimal to directly jump to C handler.
++ * r1 - PowerPC64 stack pointer:
++ *   The PowerPC64 ABI requires r1 to point to the top of a valid stack.
++ *   C functions use the stack for local variables, saving and restoring
++ *   registers etc. We allocate a 64KB stack in our linker script.
++ *
++ * r2 - TOC (Table of Contents) Register:
++ *   PowerPC64 uses a TOC/GOT for acessing global variables and function
++ *   pointers. The compiler generates code that references globals as offsets
++ *   from r2 (specially when using "string literals in printk").
++ *   The ABI requires r2 = .TOC. (we have kept this at GOT + 32KB) via our
++ *   linker script. It defines __toc_start.
++ */
++
++boot_entry:
++	/* This is how we load a 32 bit address on PowerPC.
++	 * This is defined in 64bitelfv2ABI.
++	 * lis r1, _start_top@ha => _start_top@ha << 16 since r1 is 0.
++	 * _stack_top@ha = (_stack_top + 0x8000) >> 16) # sign extended
++	 * => ((_stack_top + 0x8000) >> 16) << 16
++	 */
++	lis r1, _stack_top@ha
++	ori r1, r1, _stack_top@l
++
++	/* Setup r2 - TOC base pointer */
++	lis  r2, __toc_start@ha
++	addi r2, r2, __toc_start@l
++
++	/*
++	 * Branch and Link to our C entry point.
++	 * 'bl' stores the return address in the Link Register (LR).
++	 * When k_main returns, execution continues at the next instruction.
++	 */
++	bl k_main
++
++	/*
++	 * Let's spin forever, if k_main ever returns.
++	 * 'b .' branches to itself - an infinite loop.
++	 * Nothing else to do if we are here anyways.
++	 */
++	b .
+diff --git a/build.sh b/build.sh
+new file mode 100755
+index 0000000..d8062ce
+--- /dev/null
++++ b/build.sh
+@@ -0,0 +1,57 @@
++#!/bin/bash
++#
++# build.sh - Cross-compile our bare-metal PowerPC64 kernel
++#
++# Usage:
++#   ./build.sh            # Build the kernel
++#
++# This script:
++#   1. Compiles each .S and .c file into an object file (.o)
++#   2. Links all objects using our linker script (link.lds)
++#   3. Extracts a raw binary (kernel.bin) from the ELF
++#
++# The raw binary is what QEMU loads as BIOS - it's placed at
++# address 0x0 in memory, exactly matching our linker script layout.
++
++set -e  # Exit on any error
++
++# Cross-compiler prefix - all tools are prefixed with this
++CROSS_COMPILE=powerpc64-linux-gnu-
++
++# Include path for header files
++INCLUDE_PATH=.
++
++# Common C compiler flags:
++#   -ffreestanding  : No hosted environment (no libc startup, no main() convention)
++#   -nostdlib       : Don't link standard library
++#   -Os             : Optimize for size (keeps our binary small)
++#   -g              : Include debug symbols (for GDB)
++#   -mregnames      : Allow register names like r1, r2 instead of just 1, 2
++#   -std=gnu99      : C99 with GNU extensions (inline asm, etc.)
++CFLAGS="-ffreestanding -nostdlib -Os -g -mregnames -std=gnu99"
++
++echo "=== Building PowerPC64 bare-metal kernel ==="
++
++# Step 1: Assemble boot.S
++# The -c flag means "compile/assemble only, don't link"
++echo "  [AS]  boot.S"
++${CROSS_COMPILE}gcc -c -g -mregnames -o boot.o boot.S
++
++# Step 2: Compile C source files
++echo "  [CC]  main.c"
++${CROSS_COMPILE}gcc -c main.c -o main.o -I${INCLUDE_PATH} ${CFLAGS}
++
++# Step 3: Link everything using our linker script
++# -T link.lds specifies our custom linker script
++echo "  [LD]  kernel.elf"
++${CROSS_COMPILE}ld -T link.lds -o kernel.elf boot.o main.o
++
++# Step 4: Extract raw binary from ELF
++# objcopy -O binary strips all ELF headers and produces a flat binary.
++# This is what QEMU loads at address 0x0 when using -bios.
++echo "  [BIN] kernel.bin"
++${CROSS_COMPILE}objcopy -O binary kernel.elf kernel.bin
++
++echo "=== Build complete ==="
++echo "  kernel.elf : $(stat -c %s kernel.elf) bytes (ELF, for GDB)"
++echo "  kernel.bin : $(stat -c %s kernel.bin) bytes (raw binary, for QEMU)"
+diff --git a/gdb.sh b/gdb.sh
+new file mode 100755
+index 0000000..c69899f
+--- /dev/null
++++ b/gdb.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++#
++# gdb.sh - Connect GDB to the running QEMU instance
++#
++# Prerequisites: QEMU must be running (./run.sh) with -S -gdb tcp::1234
++#
++# This script:
++#   1. Loads the ELF file (kernel.elf) for symbol information
++#   2. Connects to QEMU's GDB stub on localhost:1234
++#   3. Sets a breakpoint at k_main
++#
++# Useful GDB commands once connected:
++#   (gdb) continue          - Start execution (QEMU is paused with -S)
++#   (gdb) info registers    - Show all GPRs
++#   (gdb) stepi             - Step one instruction
++#   (gdb) x/16i 0x0         - Disassemble from address 0x0
++#   (gdb) p/x $r1           - Print stack pointer
++#   (gdb) p/x $r2           - Print TOC pointer
++
++gdb-multiarch \
++	-ex "file kernel.elf" \
++	-ex "set arch powerpc:common64" \
++	-ex "target remote localhost:1234" \
++	-ex "break k_main" \
++	-ex "echo \nGDB connected to QEMU. Type 'continue' to start execution.\n\n"
+diff --git a/link.lds b/link.lds
+new file mode 100644
+index 0000000..55ffa4e
+--- /dev/null
++++ b/link.lds
+@@ -0,0 +1,87 @@
++/*
++ * link.lds - Linker script for our bare-metal PowerPC64 kernel
++ *
++ * A linker script tells the linker (ld) exactly where to place each
++ * section of our binary in memory. Since we have no OS loader,
++ * we must be precise about memory layout.
++ *
++ * This is how our memory map after linking would look like:
++ *
++ *   0x0000_0010  _start     - .text section (code)
++ *   ...                     - .got/.toc (global offset table)
++ *   ...          _stack_start - 64KB stack
++ *   ...          _stack_top  - top of stack (r1 points here)
++ *   ...          _end       - end of kernel (64KB aligned)
++ *   ...                     - free memory (used by memblock allocator)
++ *   0x0400_0000  __end      - end of usable memory (64MB)
++ */
++
++/*
++ * ENTRY(_start) tells the linker that _start is the entry point.
++ * This sets the ELF entry point field (used by debuggers like GDB).
++ */
++ENTRY(_start);
++
++SECTIONS
++{
++	/*
++	 * .text - Code section
++	 *
++	 * Our _start label is at the very beginning of our text section.
++	 * All compiled code (.text from all .o files) goes here.
++	 * This is defined in our entry code in boot.S
++	 *
++	 * The exception vectors (at offsets 0x300, 0x400, etc.) are part
++	 * of .text - the assembler places them using ". = 0x300" directives.
++	 */
++	.text : {
++		_start = .;
++		*(.text)
++	}
++
++	/*
++	 * .got / .toc - Global Offset Table / Table of Contents
++	 *
++	 * PowerPC64 accesses global variables and function pointers through
++	 * the TOC. The compiler generates code like:
++	 *     ld r3, var@toc(r2)
++	 *
++	 * The ABI convention is that r2 points to .TOC.. We have kept r2 to
++	 * GOT + 0x8000. This gives signed 16-bit offsets a range of
++	 * +/- 32KB around the TOC base.
++	 *
++	 * __toc_start is what we load into r2 in boot.S.
++	 *
++	 * IIRC 0x100 alignment I might have got it from 64bit ABI earlier.
++	 */
++	. = ALIGN(0x100);
++	.got : {
++		__toc_start = . + 0x8000;
++		*(.got)
++		*(.toc)
++	}
++
++	/* .stack: This is our kernel stack ;)
++	 *
++	 * since in our example we are going to use 64KB as our pagesize.
++	 * So let's use 64KB stack size for now. Note our stack grows downward,
++	 * so r1 points to _stack_top and decreases.
++	 *
++	 */
++	.stack : {
++		. = ALIGN(65536);
++		_stack_start = .;
++		. += 65536;
++		_stack_top = .;
++	}
++
++	/*
++	 * _end: This is the end of our kernel image.
++	 * Memory beyong this _end we will use for our memblock allocator.
++	 * This is the memory which kernel will use to allocate various
++	 * in-memory tables, multi-level radix page tables, and pages for
++	 * implementing our radix mmu excercises.
++	 */
++	. = ALIGN(65536);
++	_end = .;
++}
+diff --git a/main.c b/main.c
+new file mode 100644
+index 0000000..1fd2b4f
+--- /dev/null
++++ b/main.c
+@@ -0,0 +1,26 @@
++/*
++ * main.c - Kernel entry point (Chapter 2)
++ *
++ * This is the simplest possible k_main (which Maddy asked us to write) ;)
++ * Just spin forever.
++ * At this stage we have no UART, no printk - we can only verify
++ * this works by attaching GDB and checking that we reach k_main.
++ *
++ * Next we will add serial output in Chapter 3.
++ */
++
++void k_main(void)
++{
++	/*
++	 * Nothing to do yet - just spin.
++	 *
++	 * In GDB, verify we got here:
++	 *   (gdb) break k_main
++	 *   (gdb) continue
++	 *   (gdb) info registers r1 r2
++	 * r1 should point to _stack_top
++	 * r2 should point to __toc_start
++	 */
++	while (1)
++		;
++}
+diff --git a/run.sh b/run.sh
+new file mode 100755
+index 0000000..84a47a0
+--- /dev/null
++++ b/run.sh
+@@ -0,0 +1,44 @@
++#!/bin/bash
++#
++# run.sh - Launch the kernel in QEMU
++#
++# This starts a POWER9 machine emulation with:
++#   -M powernv9     : Emulate OpenPOWER POWER9 server (bare-metal, HV mode)
++#   -bios kernel.bin: Load our raw binary at address 0x0
++#   -m 1G           : 1GB of RAM
++#   -nographic      : No graphical window; serial console on terminal
++#   -d mmu          : Log MMU translations (invaluable for debugging page tables)
++#   -D qemu.log     : Write QEMU debug output to this file
++#   -S              : Pause at start - attach GDB before executing
++#   -gdb tcp::1234  : Listen for GDB connections on port 1234
++#
++# The QEMU monitor is available via telnet on port 33333:
++#   telnet localhost 33333
++#
++# To quit QEMU: press Ctrl-A then X
++#   (or from monitor: 'quit')
++
++QEMU_MONITOR_PORT=33333
++cmd_monitor="-monitor telnet:127.0.0.1:$QEMU_MONITOR_PORT,server,nowait"
++
++# Remove old log
++rm -f qemu.log
++
++echo "Starting QEMU (paused, waiting for GDB on port 1234)..."
++echo "  To connect GDB:  ./gdb.sh"
++echo "  To quit QEMU:    Ctrl-B then x"
++echo "  To enter QEMU monitor:    Ctrl-B then c"
++echo ""
++
++qemu-system-ppc64 \
++	-echr 2 \
++	${cmd_monitor} \
++	-M powernv9 \
++	-bios kernel.bin \
++	-m 1G \
++	-nographic \
++	-serial mon:stdio \
++	-d mmu \
++	-D qemu.log \
++	-S \
++	-gdb tcp::1234
+-- 
+2.39.5
+

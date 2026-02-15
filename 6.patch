@@ -1,0 +1,609 @@
+From 3b62d0181dc698f41bf3a6c5df1fc350f89a137f Mon Sep 17 00:00:00 2001
+Message-Id: <3b62d0181dc698f41bf3a6c5df1fc350f89a137f.1771142402.git.ritesh.list@gmail.com>
+In-Reply-To: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+References: <7ccdc9950b8062a8f0395ab10ee1b6ef15e75fb6.1771142402.git.ritesh.list@gmail.com>
+From: Ritesh Harjani <ritesh.list@gmail.com>
+Date: Sun, 15 Feb 2026 12:53:25 +0530
+Subject: [RFC v1 6/8] radix-kernel/chapter 8: Implement repl() and various
+ cmds
+
+Add interactive serial REPL for exploring Radix page tables:
+- walk <va>: full 4-level page table walk with decoded PTE flags
+- map <va> <pa>: dynamically map new pages
+- unmap <va>: clear PTE and invalidate mapping
+- read/write <va>: read/write memory through virtual addresses
+- info: display PTCR, LPCR, PID, LPID, MSR, table addresses
+- help/quit: basic REPL navigation
+
+Added to radix-mmu.c:
+- radix_walk_page_table(): structured walk returning all level values
+- radix_map_page/radix_unmap_page: map/unmap helpers
+- radix_print_info(): SPR state dump
+
+root-> ./run.sh
+Starting QEMU (paused, waiting for GDB on port 1234)...
+  To connect GDB:  ./gdb.sh
+  To quit QEMU:    Ctrl-B then x
+  To enter QEMU monitor:    Ctrl-B then c
+
+hello ppc-radix-kernel
+We are running on Qemu bare-metal Power9
+=== Memory Layout ===
+  _start: 0x0
+  _end:   0x30000
+  memblock initialized
+
+=== Radix MMU Initialization ===
+  k_pgd: 0xc000000000030000 (VA)
+  process table: 0x40000
+  partition table: 0x50000
+  PTCR set to: 0x50004
+  mapping kernel: PA 0x0 - 0x30000 to VA 0xc000000000000000 - 0xc000000000030000
+  mapping UART:   PA 0x60300d0010000 - 0x60300d0020000 to VA 0xc0060300d0010000 - 0xc0060300d0020000
+  mapping memblock: PA 0x30000 - 0x160000 to VA 0xc000000000030000 - 0xc000000000160000
+  page tables built successfully
+  enabling MMU (setting MSR[IR|DR])...
+  memblock_start:   0x30000
+  memblock_end:   0xc0000
+
+*** Running from virtual addresses! MMU is ON ***
+
+=== Radix MMU Explorer REPL ===
+Type 'help' for available commands.
+
+ppc> help
+Commands:
+  walk <hex_addr>   Walk page table for a virtual address
+  map <va> <pa>     Map a 64KB virtual page to physical
+  unmap <va>        Unmap a virtual page
+  read <va>         Read 8 bytes from a virtual address
+  write <va> <val>  Write 8 bytes to a virtual address
+  info              Show MMU register state
+  help              Show this help
+  quit              Halt the CPU
+ppc> walk 0xc0060300d0010000
+
+=== Page Table Walk for VA 0xc0060300d0010000 ===
+  Quadrant: 3 (kernel)
+  PGD index: 3078
+  PUD index: 3
+  PMD index: 128
+  PTE index: 1
+  Offset:    0x0
+
+  PGD @ 0xc000000000036030: 0x8000000000090009 [Valid]
+  PUD @ 0xc000000000090018: 0x80000000000a0009 [Valid]
+  PMD @ 0xc0000000000a0400: 0x80000000000b0005 [Valid]
+  PTE @ 0xc0000000000b0008: 0xc0060300d001018f
+  => Physical page: 0x60300d0010000
+  => Full PA:       0x60300d0010000
+  => Flags: Valid Leaf Ref Dirty Priv Read Write Exec
+ppc> info
+
+=== MMU Register State ===
+  PTCR: 0x50004 (partition table @ 0x50000)
+  LPCR: 0x500008 [HR] [UPRT]
+  PID:  0x0
+  LPID: 0x0
+  MSR:  0x9000000000000030 [DR] [IR]
+  k_pgd: 0xc000000000030000 (VA)
+  k_pgd: 0x30000 (PA)
+  partition_tb: 0x50000
+  process_tb:   0x40000
+ppc>
+
+Signed-off-by: Ritesh Harjani <ritesh.list@gmail.com>
+---
+ build.sh    |   5 +-
+ cmds.c      | 274 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ cmds.h      |   5 +
+ main.c      |  15 +--
+ radix-mmu.c | 117 ++++++++++++++++++++++
+ radix-mmu.h |  22 ++++-
+ 6 files changed, 423 insertions(+), 15 deletions(-)
+ create mode 100644 cmds.c
+ create mode 100644 cmds.h
+
+diff --git a/build.sh b/build.sh
+index 2761a95..9b0ce22 100755
+--- a/build.sh
++++ b/build.sh
+@@ -48,13 +48,16 @@ ${CROSS_COMPILE}gcc -c memblock.c -o memblock.o -I${INCLUDE_PATH} ${CFLAGS}
+ echo "  [CC]  radix-mmu.c"
+ ${CROSS_COMPILE}gcc -c radix-mmu.c -o radix-mmu.o -I${INCLUDE_PATH} ${CFLAGS}
+ 
++echo "  [CC]  cmds.c"
++${CROSS_COMPILE}gcc -c cmds.c -o cmds.o -I${INCLUDE_PATH} ${CFLAGS}
++
+ echo "  [CC]  main.c"
+ ${CROSS_COMPILE}gcc -c main.c -o main.o -I${INCLUDE_PATH} ${CFLAGS}
+ 
+ # Step 3: Link everything using our linker script
+ # -T link.lds specifies our custom linker script
+ echo "  [LD]  kernel.elf"
+-${CROSS_COMPILE}ld -T link.lds -o kernel.elf boot.o main.o uart.o memblock.o radix-mmu.o
++${CROSS_COMPILE}ld -T link.lds -o kernel.elf boot.o main.o uart.o memblock.o radix-mmu.o cmds.o
+ 
+ # Step 4: Extract raw binary from ELF
+ # objcopy -O binary strips all ELF headers and produces a flat binary.
+diff --git a/cmds.c b/cmds.c
+new file mode 100644
+index 0000000..6b7e2a2
+--- /dev/null
++++ b/cmds.c
+@@ -0,0 +1,274 @@
++/*
++ * cmds.c: Implements the repl() loop and various commands.
++ * After booting and enabling the Radix MMU, we drop into a REPL
++ * (Read-Eval-Print Loop) that allows us to explore radix mmu implementation
++ * and do various cool things.
++ *
++ * Commands:
++ *   walk <hex_addr>	- Walk page table for a virtual address
++ *   map <va> <pa>	- Map a new virtual page to physical
++ *   unmap <va>		- Remove a page mapping
++ *   read <va>		- Read 8 bytes from a virtual address
++ *   write <va> <val>	- Write 8 bytes to a virtual address
++ *   info		- Show MMU register state (PTCR, LPCR, etc.)
++ *   help		- Show available commands
++ *   quit		- Halt
++ */
++
++#include "uart.h"
++#include "memblock.h"
++#include "radix-mmu.h"
++
++/* ============================================================
++ * String utilities (no libc, so we implement our own)
++ * ============================================================
++ */
++static inline int strlen(const char *s)
++{
++	int n = 0;
++	while (*s++) n++;
++	return n;
++}
++
++static inline int strncmp(const char *a, const char *b, int n)
++{
++	while (n-- > 0) {
++		if (*a != *b || !*a) return *a - *b;
++		a++; b++;
++	}
++	return 0;
++}
++
++/*
++ * Parse a hexadecimal string into a uint64_t.
++ * Skips optional "0x" prefix.
++ */
++static inline uint64_t parse_hex(const char *s)
++{
++	uint64_t val = 0;
++
++	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
++		s += 2;
++
++	while (*s) {
++		char c = *s++;
++		uint64_t digit;
++		if (c >= '0' && c <= '9')
++			digit = c - '0';
++		else if (c >= 'a' && c <= 'f')
++			digit = c - 'a' + 10;
++		else if (c >= 'A' && c <= 'F')
++			digit = c - 'A' + 10;
++		else
++			break;
++		val = (val << 4) | digit;
++	}
++	return val;
++}
++
++static inline const char *skip_spaces(const char *s)
++{
++	while (*s == ' ' || *s == '\t') s++;
++	return s;
++}
++
++static inline const char *skip_word(const char *s)
++{
++	while (*s && *s != ' ' && *s != '\t') s++;
++	return s;
++}
++
++/* ============================================================
++ * REPL: read a line from serial console
++ * ============================================================
++ */
++static int read_line(char *buf, int max)
++{
++	int i = 0;
++	while (i < max - 1) {
++		char c = uart_getc();
++
++		if (c == '\r' || c == '\n') {
++			uart_putc('\n');
++			break;
++		}
++
++		if (c == 0x7f || c == '\b') {
++			if (i > 0) {
++				i--;
++				uart_puts("\b \b");
++			}
++			continue;
++		}
++
++		if (c >= 0x20 && c < 0x7f) {
++			buf[i++] = c;
++			uart_putc(c);
++		}
++	}
++	buf[i] = '\0';
++	return i;
++}
++
++/* ============================================================
++ * REPL command implementations
++ * ============================================================
++ */
++static void cmd_help(void)
++{
++	printk("Commands:\n");
++	printk("  walk <hex_addr>	Walk page table for a virtual address\n");
++	printk("  map <va> <pa>		Map a 64KB virtual page to physical\n");
++	printk("  unmap <va>		Unmap a virtual page\n");
++	printk("  read <va>		Read 8 bytes from a virtual address\n");
++	printk("  write <va> <val>	Write 8 bytes to a virtual address\n");
++	printk("  info			Show MMU register state\n");
++	printk("  help			Show this help\n");
++	printk("  quit			Halt the CPU\n");
++}
++
++/*
++ * cmd_walk - Walk the page table for a given virtual address.
++ *
++ * This is a common trick in OS kernels - Linux does something similar
++ * in its early boot code (arch/powerpc/kernel/head_64.S).
++ * This shows exactly what the hardware does during translation.
++ */
++static void cmd_walk(uint64_t addr)
++{
++	struct walk_result wr;
++
++	printk("\n=== Page Table Walk for VA 0x%x ===\n", addr);
++
++	/* Show quadrant (top 2 bits) */
++	uint64_t quadrant = (addr >> 62) & 0x3;
++	printk("  Quadrant: %d (%s)\n", (int)quadrant,
++		quadrant == 3 ? "kernel" :
++		quadrant == 0 ? "user" : "reserved");
++
++	/* Decode indices */
++	printk("  PGD index: %d\n", (int)((addr >> 39) & 0x1FFF));
++	printk("  PUD index: %d\n", (int)((addr >> 30) & 0x1FF));
++	printk("  PMD index: %d\n", (int)((addr >> 21) & 0x1FF));
++	printk("  PTE index: %d\n", (int)((addr >> 16) & 0x1F));
++	printk("  Offset:    0x%x\n", addr & 0xFFFF);
++
++	/* Walk the table */
++	radix_walk_page_table(addr, &wr);
++
++	printk("\n  PGD @ 0x%x: 0x%x", wr.pgd_addr, wr.pgd_val);
++	if (wr.depth < 1) { printk(" [EMPTY]\n"); return; }
++	printk(" [Valid]\n");
++
++	printk("  PUD @ 0x%x: 0x%x", wr.pud_addr, wr.pud_val);
++	if (wr.depth < 2) { printk(" [EMPTY]\n"); return; }
++	printk(" [Valid]\n");
++
++	printk("  PMD @ 0x%x: 0x%x", wr.pmd_addr, wr.pmd_val);
++	if (wr.depth < 3) { printk(" [EMPTY]\n"); return; }
++	printk(" [Valid]\n");
++
++	printk("  PTE @ 0x%x: 0x%x\n", wr.pte_addr, wr.pte_val);
++
++	if (wr.depth < 4 || !wr.pte_val) {
++		printk("  => NOT MAPPED\n");
++		return;
++	}
++
++	/* Decode the PTE */
++	uint64_t rpn = wr.pte_val & 0x01fffffffffff000ULL;
++	printk("  => Physical page: 0x%x\n", rpn);
++	printk("  => Full PA:       0x%x\n", rpn | (addr & 0xFFFF));
++	printk("  => Flags:");
++	if (wr.pte_val & (1ULL << 63)) printk(" Valid");
++	if (wr.pte_val & (1ULL << 62)) printk(" Leaf");
++	if (wr.pte_val & (1ULL << 8))  printk(" Ref");
++	if (wr.pte_val & (1ULL << 7))  printk(" Dirty");
++	if (wr.pte_val & (1ULL << 3))  printk(" Priv");
++	if (wr.pte_val & (1ULL << 2))  printk(" Read");
++	if (wr.pte_val & (1ULL << 1))  printk(" Write");
++	if (wr.pte_val & (1ULL << 0))  printk(" Exec");
++	printk("\n");
++}
++
++static void cmd_map(uint64_t va, uint64_t pa)
++{
++	printk("Mapping VA 0x%x -> PA 0x%x\n", va, pa);
++	radix_map_page(va, pa);
++	printk("Done. Use 'walk 0x%x' to verify.\n", va);
++}
++
++static void cmd_unmap(uint64_t va)
++{
++	printk("Unmapping VA 0x%x\n", va);
++	radix_unmap_page(va);
++	printk("Done.\n");
++}
++
++static void cmd_read(uint64_t va)
++{
++	printk("Reading 8 bytes from VA 0x%x: ", va);
++	uint64_t val = *(volatile uint64_t *)va;
++	printk("0x%x\n", val);
++}
++
++static void cmd_write(uint64_t va, uint64_t val)
++{
++	printk("Writing 0x%x to VA 0x%x\n", val, va);
++	*(volatile uint64_t *)va = val;
++	printk("Done.\n");
++}
++
++static void cmd_info(void)
++{
++	printk("\n=== MMU Register State ===\n");
++	radix_print_info();
++}
++
++/* ============================================================
++ * REPL - Read-Eval-Print Loop
++ * ============================================================
++ */
++void repl(void)
++{
++	char buf[128];
++
++	printk("\n=== Radix MMU Explorer REPL ===\n");
++	printk("Type 'help' for available commands.\n\n");
++
++	while (1) {
++		printk("ppc> ");
++		int len = read_line(buf, sizeof(buf));
++		if (len == 0) continue;
++
++		const char *cmd = skip_spaces(buf);
++
++		if (strncmp(cmd, "help", 4) == 0 || cmd[0] == '?') {
++			cmd_help();
++		} else if (strncmp(cmd, "quit", 4) == 0) {
++			printk("Halting.\n");
++			while (1) ;
++		} else if (strncmp(cmd, "info", 4) == 0) {
++			cmd_info();
++		} else if (strncmp(cmd, "walk ", 5) == 0) {
++			const char *arg = skip_spaces(cmd + 5);
++			cmd_walk(parse_hex(arg));
++		} else if (strncmp(cmd, "map ", 4) == 0) {
++			const char *arg1 = skip_spaces(cmd + 4);
++			const char *arg2 = skip_spaces(skip_word(arg1));
++			cmd_map(parse_hex(arg1), parse_hex(arg2));
++		} else if (strncmp(cmd, "unmap ", 6) == 0) {
++			const char *arg = skip_spaces(cmd + 6);
++			cmd_unmap(parse_hex(arg));
++		} else if (strncmp(cmd, "read ", 5) == 0) {
++			const char *arg = skip_spaces(cmd + 5);
++			cmd_read(parse_hex(arg));
++		} else if (strncmp(cmd, "write ", 6) == 0) {
++			const char *arg1 = skip_spaces(cmd + 6);
++			const char *arg2 = skip_spaces(skip_word(arg1));
++			cmd_write(parse_hex(arg1), parse_hex(arg2));
++		} else {
++			printk("Unknown command: %s\nType 'help' for commands.\n", buf);
++		}
++	}
++}
+diff --git a/cmds.h b/cmds.h
+new file mode 100644
+index 0000000..94c626f
+--- /dev/null
++++ b/cmds.h
+@@ -0,0 +1,5 @@
++#ifndef _CMDS_H
++#define _CMDS_H
++
++extern void repl();
++#endif
+diff --git a/main.c b/main.c
+index bcc4e72..8716d19 100644
+--- a/main.c
++++ b/main.c
+@@ -17,6 +17,7 @@
+ #include "uart.h"
+ #include "memblock.h"
+ #include "radix-mmu.h"
++#include "cmds.h"
+ 
+ /*
+  * jump_to_offset - Relocate the kernel to virtual addresses.
+@@ -96,17 +97,5 @@ void k_main(void)
+ 	 */
+ 	printk("\n*** Running from virtual addresses! MMU is ON ***\n");
+ 
+-
+-	/*
+-	 * Nothing to do yet - just spin.
+-	 *
+-	 * In GDB, verify we got here:
+-	 *   (gdb) break k_main
+-	 *   (gdb) continue
+-	 *   (gdb) info registers r1 r2
+-	 * r1 should point to _stack_top
+-	 * r2 should point to __toc_start
+-	 */
+-	while (1)
+-		;
++	repl();
+ }
+diff --git a/radix-mmu.c b/radix-mmu.c
+index 5baa2ae..f1db812 100644
+--- a/radix-mmu.c
++++ b/radix-mmu.c
+@@ -644,3 +644,120 @@ void radix_mmu_init(void)
+ 
+ 	printk("  page tables built successfully\n");
+ }
++
++
++/* ============================================================
++ * Section: radix related helper routines to help the cmds
++ * which the user can execute from cmds.c / repl.
++ * ============================================================
++ */
++
++/*
++ * radix_walk_page_table - Walk the page table for a VA.
++ * Fills in the walk_result struct with addresses and values
++ * at each level. 'depth' indicates how far we got.
++ */
++void radix_walk_page_table(uint64_t va, struct walk_result *r)
++{
++	pgd_t *pgdp;
++	pud_t *pudp;
++	pmd_t *pmdp;
++	pte_t *ptep;
++
++	r->depth = 0;
++
++	pgdp = pgd_offset_k(va);
++	r->pgd_addr = (uint64_t)pgdp;
++	r->pgd_val = pgd_raw(*pgdp);
++
++	if (pgd_none(*pgdp))
++		return;
++	r->depth = 1;
++
++	pudp = pud_offset(pgdp, va);
++	r->pud_addr = (uint64_t)pudp;
++	r->pud_val = pud_raw(*pudp);
++
++	if (pud_none(*pudp))
++		return;
++	r->depth = 2;
++
++	pmdp = pmd_offset(pudp, va);
++	r->pmd_addr = (uint64_t)pmdp;
++	r->pmd_val = pmd_raw(*pmdp);
++
++	if (!pmd_present(*pmdp))
++		return;
++	r->depth = 3;
++
++	ptep = pte_offset(pmdp, va);
++	r->pte_addr = (uint64_t)ptep;
++	r->pte_val = pte_raw(*ptep);
++	r->depth = 4;
++}
++
++/*
++ * radix_map_page - Map a VA to a PA with PAGE_KERNEL_X permissions.
++ */
++void radix_map_page(uint64_t va, uint64_t pa)
++{
++	map_kernel_page(va, pa, PAGE_KERNEL, PAGE_SIZE);
++	asm volatile("ptesync" ::: "memory");
++}
++
++/*
++ * radix_unmap_page - Clear the PTE for a VA.
++ * Also invalidates the TLB entry.
++ */
++void radix_unmap_page(uint64_t va)
++{
++	pgd_t *pgdp = pgd_offset_k(va);
++	if (pgd_none(*pgdp)) return;
++
++	pud_t *pudp = pud_offset(pgdp, va);
++	if (pud_none(*pudp)) return;
++
++	pmd_t *pmdp = pmd_offset(pudp, va);
++	if (!pmd_present(*pmdp)) return;
++
++	pte_t *ptep = pte_offset(pmdp, va);
++	/* Clear the PTE */
++	*ptep = __pte(0);
++
++	/*
++	 * Invalidate the TLB entry for this VA.
++	 */
++	asm volatile ("tlbie %0, 0; sync" : : "r" (va) : "memory");
++	asm volatile("ptesync" ::: "memory");
++	asm volatile("isync" ::: "memory");
++}
++
++/*
++ * radix_print_info - Print MMU-related SPR values.
++ */
++void radix_print_info(void)
++{
++	uint64_t ptcr = mfspr(SPRN_PTCR);
++	uint64_t lpcr = mfspr(SPRN_LPCR);
++	uint64_t pid  = mfspr(SPRN_PID);
++	uint64_t lpid = mfspr(SPRN_LPID);
++	uint64_t msr;
++	asm volatile("mfmsr %0" : "=r"(msr));
++
++	printk("  PTCR: 0x%x (partition table @ 0x%x)\n",
++		ptcr, ptcr & ~0xFULL);
++	printk("  LPCR: 0x%x", lpcr);
++	if (lpcr & LPCR_HR)   printk(" [HR]");
++	if (lpcr & LPCR_UPRT) printk(" [UPRT]");
++	printk("\n");
++	printk("  PID:  0x%x\n", pid);
++	printk("  LPID: 0x%x\n", lpid);
++	printk("  MSR:  0x%x", msr);
++	if (msr & (1ULL << 5)) printk(" [DR]");
++	if (msr & (1ULL << 4)) printk(" [IR]");
++	printk("\n");
++	printk("  k_pgd: 0x%x (VA)\n", (uint64_t)k_pgd);
++	printk("  k_pgd: 0x%x (PA)\n", __pa((uint64_t)k_pgd));
++	printk("  partition_tb: 0x%x\n", (uint64_t)partition_tb);
++	printk("  process_tb:   0x%x\n", (uint64_t)process_tb);
++}
+diff --git a/radix-mmu.h b/radix-mmu.h
+index ca6fc09..310cb7d 100644
+--- a/radix-mmu.h
++++ b/radix-mmu.h
+@@ -184,5 +184,25 @@
+ extern void radix_mmu_init(void);
+ extern void radix_mmu_enable(void);
+ 
+-
++typedef unsigned long long uint64_t;
++/*
++ * Page table walk - returns values at each level.
++ * walk_result is filled by radix_walk_page_table().
++ */
++struct walk_result {
++	uint64_t pgd_addr;	/* Address of the PGD entry */
++	uint64_t pgd_val;	/* Raw value of the PGD entry */
++	uint64_t pud_addr;	/* Address of the PUD entry */
++	uint64_t pud_val;	/* Raw value of the PUD entry */
++	uint64_t pmd_addr;	/* Address of the PMD entry */
++	uint64_t pmd_val;	/* Raw value of the PMD entry */
++	uint64_t pte_addr;	/* Address of the PTE entry */
++	uint64_t pte_val;	/* Raw value of the PTE entry */
++	int depth;			/* How far we got: 0=pgd empty, ..., 4=pte found */
++};
++
++extern void radix_walk_page_table(uint64_t va, struct walk_result *r);
++extern void radix_print_info();
++extern void radix_map_page(uint64_t va, uint64_t pa);
++extern void radix_unmap_page();
+ #endif
+-- 
+2.39.5
+
